@@ -1,0 +1,13 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# 运行时生成的文件
+processor_settings.json
+
+# 编辑器备份
+*.bak
+
+# IDE
+.idea/
+.vscode/
