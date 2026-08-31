@@ -2,6 +2,11 @@
 __pycache__/
 *.py[cod]
 
+# PyInstaller 构建产物
+build/
+dist/
+*.spec
+
 # 运行时生成的文件
 processor_settings.json
 

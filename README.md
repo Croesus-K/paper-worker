@@ -42,6 +42,12 @@
 
 ## 运行环境与使用
 
+**方式一：直接下载 exe（推荐，无需 Python）**
+
+到 [Releases](https://github.com/Croesus-K/paper-worker/releases) 下载 `全能TXT文本处理器.exe`，双击即用（已内置拖放支持，杀软若误报请添加信任）。
+
+**方式二：从源码运行**
+
 ```bash
 # Python 3.x（tkinter 标准库自带，无需额外安装 GUI 依赖）
 
@@ -52,11 +58,20 @@ pip install tkinterdnd2
 python 全能TXT文本处理器.py
 ```
 
+**方式三：自行打包 exe**
+
+```bash
+pip install pyinstaller tkinterdnd2
+scripts\build_exe.bat   # 或双击运行，输出位于 dist/
+```
+
 ## 项目结构
 
 ```
 paper-worker/
 ├── 全能TXT文本处理器.py   # 全部代码，单文件，开箱即用
+├── scripts/
+│   └── build_exe.bat      # PyInstaller 一键打包脚本
 ├── README.md
 ├── LICENSE
 └── .gitignore
