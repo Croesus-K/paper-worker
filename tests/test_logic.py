@@ -1,0 +1,152 @@
+# -*- coding: utf-8 -*-
+"""纯逻辑单元测试（不启动 GUI）：python tests/test_logic.py"""
+import importlib.util
+import os
+import re
+import unittest
+
+SPEC = importlib.util.spec_from_file_location(
+    "processor",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "全能TXT文本处理器.py"))
+processor = importlib.util.module_from_spec(SPEC)
+SPEC.loader.exec_module(processor)
+
+split_by = processor.split_chapters_by_pattern
+P = processor._CHAPTER_PRESETS
+
+
+def compile_preset(name):
+    return re.compile(P[name])
+
+
+class TestSplitChapters(unittest.TestCase):
+    def test_basic_split(self):
+        text = "前言内容\n第一章 起点\n正文A\n第二章 转折\n正文B"
+        blocks = split_by(text, compile_preset("第X章"))
+        self.assertEqual(blocks[0], (None, "前言内容"))
+        self.assertEqual(len(blocks), 3)
+        self.assertEqual(blocks[1][0], "第一章 起点")
+        self.assertEqual(blocks[1][1], "正文A")
+        self.assertNotIn("第一章", blocks[1][1])
+
+    def test_no_match(self):
+        blocks = split_by("没有任何章节标题的文本", compile_preset("第X章"))
+        self.assertEqual(blocks, [(None, "没有任何章节标题的文本")])
+
+    def test_broad_preset(self):
+        text = "卷前说明\n第一卷 开端\n卷内容\n第十二章 转折\n章内容\n第三回 回目\n回内容"
+        blocks = split_by(text, compile_preset("第X章/卷/回/节/集/篇"))
+        self.assertEqual(len(blocks), 4)
+        self.assertEqual(blocks[0], (None, "卷前说明"))
+        self.assertEqual(blocks[2][0], "第十二章 转折")
+        # 文本以章节标题开头时，不存在"开头内容"块
+        text2 = "第一卷 开端\n卷内容\n第三回 回目\n回内容"
+        blocks2 = split_by(text2, compile_preset("第X章/卷/回/节/集/篇"))
+        self.assertEqual(len(blocks2), 2)
+        self.assertEqual(blocks2[0][0], "第一卷 开端")
+
+    def test_special_chapters(self):
+        text = "本书由某某整理\n序章 风起\n序内容\n第一章 起\n内容\n番外1 彩蛋\n番内容"
+        blocks = split_by(text, compile_preset("第X章+序章/楔子/番外"))
+        titles = [t for t, _ in blocks]
+        self.assertEqual(titles, [None, "序章 风起", "第一章 起", "番外1 彩蛋"])
+
+    def test_mid_line_mention_not_matched(self):
+        # 正文行中间出现的"第X章"不应被误认为标题
+        text = "开头内容\n他说第三章写得好。\n第一章 真·标题\n正文"
+        blocks = split_by(text, compile_preset("第X章"))
+        self.assertEqual([t for t, _ in blocks], [None, "第一章 真·标题"])
+
+    def test_english_chapter(self):
+        text = "Prologue\nChapter 1 Start\nbody\nChapter 2 End\nbody2"
+        blocks = split_by(text, compile_preset("Chapter X（英文）"))
+        self.assertEqual([t for t, _ in blocks][1:], ["Chapter 1 Start", "Chapter 2 End"])
+
+    def test_custom_regex_with_group(self):
+        # 用户自定义正则含捕获组时，finditer 方式仍应正确切分；标题取整行（含副标题）
+        text = "开头\n第1章 A\nx\n第2章 B\ny"
+        blocks = split_by(text, re.compile(r"(第\d+章)"))
+        self.assertEqual(len(blocks), 3)
+        self.assertEqual(blocks[0], (None, "开头\n"))
+        self.assertEqual(blocks[1][0], "第1章 A")
+        self.assertEqual(blocks[1][1], "x\n")
+
+    def test_duplicate_titles_unique_filenames_basis(self):
+        text = "第一章 相同\nA内容\n第一章 相同\nB内容"
+        blocks = split_by(text, compile_preset("第X章"))
+        self.assertEqual(len(blocks), 2)
+
+
+class TestDedupChapters(unittest.TestCase):
+    def test_exact_duplicate_removed(self):
+        blocks = [(None, "前言"), ("第一章 A", "正文内容XYZ"), ("第一章 A", "正文内容XYZ"),
+                  ("第二章 B", "另一段")]
+        kept, removed = processor.dedup_chapter_blocks(blocks)
+        self.assertEqual(len(kept), 3)
+        self.assertEqual(len(removed), 1)
+        self.assertIn("完全重复", removed[0])
+
+    def test_same_title_similar_removed(self):
+        a = "这是第一章的正文内容，讲述主角登场的故事，" * 20
+        b = a[:-5] + "略有不同的结尾补充"
+        blocks = [("第一章 A", a), ("第一章 A", b), ("第二章 B", "完全不同的另一章内容")]
+        kept, removed = processor.dedup_chapter_blocks(blocks)
+        self.assertEqual(len(kept), 2)
+        self.assertEqual(len(removed), 1)
+        self.assertIn("相似", removed[0])
+
+    def test_same_title_different_content_kept(self):
+        a = "第一章讲的是主角在山中修炼，偶遇机缘，" * 30
+        b = "第一章重写版：主角在都市醒来，发现世界大变样，" * 30
+        blocks = [("第一章", a), ("第一章", b)]
+        kept, removed = processor.dedup_chapter_blocks(blocks)
+        self.assertEqual(len(kept), 2)
+        self.assertEqual(len(removed), 0)
+
+    def test_order_and_preface_preserved(self):
+        blocks = [(None, "开头散落内容"), ("第一章 A", "甲"), ("第二章 B", "乙")]
+        kept, removed = processor.dedup_chapter_blocks(blocks)
+        self.assertEqual(kept, blocks)
+        self.assertEqual(removed, [])
+
+
+class TestAdFilter(unittest.TestCase):
+    def test_contains_mode(self):
+        text = "正文第一行\n本章未完点击下一页\n正文第二行\n广告：某某站点\n正文第三行"
+        new_text, removed = processor.filter_ad_lines(text, ["点击下一页", "广告："])
+        self.assertEqual(removed, 2)
+        self.assertNotIn("点击下一页", new_text)
+        self.assertIn("正文第二行", new_text)
+
+    def test_whole_line_mode(self):
+        text = "正文：请看下一页\n下一页\n尾部"
+        new_text, removed = processor.filter_ad_lines(text, ["下一页"], whole_line=True)
+        self.assertEqual(removed, 1)
+        self.assertIn("请看下一页", new_text)
+        self.assertNotIn("\n下一页\n", "\n" + new_text + "\n")
+
+    def test_empty_keywords_noop(self):
+        text = "保持\n原样\n"
+        new_text, removed = processor.filter_ad_lines(text, ["", "  "])
+        self.assertEqual((new_text, removed), (text, 0))
+
+    def test_crlf_normalized(self):
+        new_text, removed = processor.filter_ad_lines("a\r\n广告行\r\nb", ["广告"])
+        self.assertEqual(removed, 1)
+        self.assertNotIn("\r", new_text)
+
+
+class TestBlankLines(unittest.TestCase):
+    def test_compress(self):
+        text = "A\n\n\n\n\nB\n   \n\t\nC"
+        self.assertEqual(processor.compress_blank_lines(text), "A\n\nB\n\nC")
+
+    def test_leading_blank_removed(self):
+        self.assertEqual(processor.compress_blank_lines("\n\n\nA"), "A")
+
+    def test_strip_edges(self):
+        self.assertEqual(processor.strip_line_edges("  x　\n\ty \n z"), "x\ny\nz")
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

@@ -29,10 +29,19 @@
      编辑区右键菜单（撤销/重做/剪贴板/全选）、任务执行时自动禁用相关按钮、
      文件列表计数、状态栏显示文件编码与大小、窗口顶部标题栏与忙碌指示
 
+2.3 新增：
+ 16. 章节分割升级：内置多种章节标题规则（第X章/卷/回/节/集/篇、序章楔子番外、Chapter X），
+     支持自定义正则；分割前可预览章节列表与字数，分割后自动生成"章节索引.txt"
+ 17. 新增小说清洗：广告词过滤（关键词列表可保存/从文件导入，删除含关键词的行）、
+     章节去重（内容完全相同或同标题正文高度相似的章节自动剔除，保留靠前章节）
+ 18. 新增排版整理：压缩连续空行、清理行首尾空白
+ 19. 保存新增换行符选项（默认/LF/CRLF）；.bak 备份改为按字节复制，原样保留原始换行
+
 所有处理仅修改内存，需手动"保存到原文件"或"另存为新文件"才会写盘。
 运行依赖：tkinterdnd2（可选，pip install tkinterdnd2，用于拖放）
 """
 
+import difflib
 import json
 import os
 import queue
@@ -49,7 +58,7 @@ except ImportError:
     DND_AVAILABLE = False
 
 # 默认窗口标题
-DEFAULT_TITLE = "全能TXT文本处理器 2.2"
+DEFAULT_TITLE = "全能TXT文本处理器 2.3"
 
 # ------------------------------ 界面主题配色（扁平化浅色主题） ------------------------------
 COLOR_BG        = "#EEF1F5"   # 页面背景
@@ -79,6 +88,112 @@ _EXTRACT_PATTERNS = {
     "手机号": r"(?<!\d)1[3-9]\d{9}(?!\d)",
 }
 
+# 内置章节标题规则（名称 -> 正则；行首锚定避免正文提及"第X章"被误切，
+# 切分时用 finditer 定位，不含捕获组）
+_CHAPTER_PRESETS = {
+    "第X章": r"(?:^|\n)\s*第[一二三四五六七八九十百千万\d]+章",
+    "第X章/卷/回/节/集/篇": r"(?:^|\n)\s*第[一二三四五六七八九十百千万\d]+[章卷回节集篇]",
+    "第X章+序章/楔子/番外": r"(?:^|\n)\s*(?:第[一二三四五六七八九十百千万\d]+[章卷回节集篇]|序章|楔子|引子|番外[一二三四五六七八九十\d]*)",
+    "Chapter X（英文）": r"(?:^|\n)\s*(?:Chapter|CHAPTER)\s+\d+",
+}
+
+
+def split_chapters_by_pattern(content, pattern):
+    """按章节标题正则切分文本（finditer 定位，兼容含/不含捕获组的任意正则）。
+    标题取匹配所在的整行（如"第一章 起点"），正文从标题行之后开始。
+    返回 [(标题或 None, 正文), ...]；标题为 None 表示第一章之前的开头内容。"""
+    matches = list(pattern.finditer(content))
+    if not matches:
+        return [(None, content)]
+    blocks = []
+    if matches[0].start() > 0:
+        blocks.append((None, content[:matches[0].start()]))
+    for i, m in enumerate(matches):
+        # 标题取匹配所在整行（含前导换行，如"第一章 起点"）；从匹配结束处找行尾，
+        # 因为行首锚定的匹配从上一行的 \n 开始
+        line_end = content.find("\n", m.end())
+        if line_end == -1:
+            line_end = len(content)
+        title = content[m.start():line_end].strip()
+        body_start = max(line_end + 1, m.end())
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(content)
+        blocks.append((title, content[body_start:end]))
+    return blocks
+
+
+def normalize_chapter_title(title):
+    """归一化章节标题：去空白与常见分隔符，用于同标题判断"""
+    return re.sub(r"[\s：:．.。\-—_~～]+", "", title or "")
+
+
+def dedup_chapter_blocks(blocks, similarity_threshold=0.9):
+    """章节去重：正文完全相同直接剔除；标题相同且正文相似度达到阈值时剔除靠后的章节。
+    返回 (去重后的 blocks, 被剔除标题列表)。"""
+    kept = []
+    removed = []
+    seen_bodies = set()      # 归一化正文 -> 完全重复判定
+    title_bodies = {}        # 归一化标题 -> 首次出现的归一化正文（用于同标题相似比较）
+    for title, body in blocks:
+        norm_body = re.sub(r"\s+", "", body)
+        if title is None or not norm_body:
+            kept.append((title, body))
+            continue
+        if norm_body in seen_bodies:
+            removed.append(f"{title}（内容完全重复）")
+            continue
+        key = normalize_chapter_title(title)
+        prev = title_bodies.get(key)
+        if prev is not None:
+            # 超长章节截断比较，避免 O(n) 全文比对耗时
+            ratio = difflib.SequenceMatcher(None, prev[:20000], norm_body[:20000]).ratio()
+            if ratio >= similarity_threshold:
+                removed.append(f"{title}（同标题，正文相似度 {ratio:.0%}）")
+                continue
+        seen_bodies.add(norm_body)
+        title_bodies[key] = norm_body
+        kept.append((title, body))
+    return kept, removed
+
+
+def filter_ad_lines(text, keywords, whole_line=False):
+    """删除包含任一关键词的行（whole_line=True 时仅删除整行恰好等于关键词的行）。
+    返回 (新文本, 删除行数)。"""
+    kws = [k for k in (keywords or []) if k]
+    if not kws:
+        return text, 0
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    removed = 0
+    out = []
+    for line in text.split("\n"):
+        stripped = line.strip()
+        if stripped and (stripped in kws if whole_line else any(k in stripped for k in kws)):
+            removed += 1
+        else:
+            out.append(line)
+    return "\n".join(out), removed
+
+
+def compress_blank_lines(text):
+    """把连续空行（含纯空白行）压缩为一个空行，并去掉开头空行"""
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    out = []
+    blank = False
+    for line in text.split("\n"):
+        if line.strip():
+            blank = False
+            out.append(line)
+        elif not blank:
+            blank = True
+            out.append("")
+    while out and out[0] == "":
+        out.pop(0)
+    return "\n".join(out)
+
+
+def strip_line_edges(text):
+    """清理每行首尾的空白（半角/全角空格、制表符）"""
+    return "\n".join(line.strip(" \t　") for line in text.split("\n"))
+
 
 class TextProcessorApp:
     def __init__(self, root):
@@ -104,6 +219,9 @@ class TextProcessorApp:
         self.current_encoding = "utf-8"  # 默认编码（界面显示名）
         self._sync_job = None          # 编辑同步的定时任务
         self.last_find_pos = 0         # 查找位置（字符偏移量）
+        self.ad_filter_words = []      # 广告过滤关键词列表（持久化）
+        self.ad_whole_line = False     # 广告过滤：整行完全匹配才删除
+        self.newline_var = tk.StringVar(value="默认")  # 保存时的换行符模式
 
         # 界面控件注册
         self.task_buttons = []         # 任务执行期间需要禁用的按钮
@@ -347,14 +465,24 @@ class TextProcessorApp:
                 self.root.geometry(geometry)
             except Exception:
                 pass
+        newline_mode = settings.get("newline_mode")
+        if newline_mode in ("默认", "LF (Unix)", "CRLF (Windows)"):
+            self.newline_var.set(newline_mode)
+        words = settings.get("ad_filter_words")
+        if isinstance(words, list):
+            self.ad_filter_words = [str(w) for w in words if str(w).strip()]
+        self.ad_whole_line = bool(settings.get("ad_whole_line", False))
 
     def save_settings(self):
-        """保存设置（编码、窗口大小）"""
+        """保存设置（编码、窗口大小、换行符、广告过滤词）"""
         try:
             with open(self._settings_path, "w", encoding="utf-8") as f:
                 json.dump({
                     "encoding": self.encode_var.get(),
                     "geometry": self.root.geometry(),
+                    "newline_mode": self.newline_var.get(),
+                    "ad_filter_words": self.ad_filter_words,
+                    "ad_whole_line": self.ad_whole_line,
                 }, f, ensure_ascii=False, indent=2)
         except Exception:
             pass
@@ -379,7 +507,7 @@ class TextProcessorApp:
         header_inner.pack(fill=tk.X, padx=14, pady=8)
         tk.Label(header_inner, text="全能TXT文本处理器", bg=COLOR_PRIMARY, fg="#FFFFFF",
                  font=(face, 15, "bold")).pack(side=tk.LEFT)
-        tk.Label(header_inner, text="v2.2 · 仅修改内存 · 手动保存", bg=COLOR_PRIMARY,
+        tk.Label(header_inner, text="v2.3 · 仅修改内存 · 手动保存", bg=COLOR_PRIMARY,
                  fg="#BFDBFE", font=(face, 9)).pack(side=tk.LEFT, padx=(10, 0), pady=(4, 0))
         self.busy_label = tk.Label(header_inner, text="", bg=COLOR_PRIMARY, fg="#FDE68A",
                                    font=(face, 10, "bold"))
@@ -546,6 +674,12 @@ class TextProcessorApp:
                 ("去除日期信息", lambda: self.process_selected_files(self.remove_date_info)),
                 ("去除HTML标签", lambda: self.process_selected_files(self.strip_html_tags)),
             ]),
+            ("小说", [
+                ("过滤广告行", self.process_filter_ad_lines),
+                ("章节去重", self.process_dedup_chapters),
+                ("压缩连续空行", lambda: self.process_selected_files(compress_blank_lines)),
+                ("清理行首尾空白", lambda: self.process_selected_files(strip_line_edges)),
+            ]),
             ("转换", [
                 ("转大写", lambda: self.process_selected_files(self.to_uppercase)),
                 ("转小写", lambda: self.process_selected_files(self.to_lowercase)),
@@ -583,7 +717,7 @@ class TextProcessorApp:
         self._action_button(btn_frame4, "另存为新文件", self.save_as_new_file)
 
         progress_frame = ttk.Frame(save_group)
-        progress_frame.pack(fill=tk.X, pady=(2, 8), padx=4)
+        progress_frame.pack(fill=tk.X, pady=(2, 2), padx=4)
         ttk.Label(progress_frame, text="进度", style="Muted.TLabel", width=5).pack(side=tk.LEFT)
         self.progress_var = tk.DoubleVar()
         self.progress_bar = ttk.Progressbar(
@@ -593,6 +727,17 @@ class TextProcessorApp:
             mode="determinate"
         )
         self.progress_bar.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=3)
+
+        # 换行符选项（影响"保存到原文件/另存为新文件"的写盘格式）
+        newline_frame = ttk.Frame(save_group)
+        newline_frame.pack(fill=tk.X, pady=(2, 8), padx=4)
+        ttk.Label(newline_frame, text="换行符", style="Muted.TLabel", width=5).pack(side=tk.LEFT)
+        newline_combo = ttk.Combobox(
+            newline_frame, textvariable=self.newline_var,
+            values=["默认", "LF (Unix)", "CRLF (Windows)"], state="readonly", width=14)
+        newline_combo.pack(side=tk.LEFT, padx=3)
+        ttk.Label(newline_frame, text="（保存到原文件/另存时生效）",
+                  style="Muted.TLabel").pack(side=tk.LEFT, padx=3)
 
         # 固定卡片底部锚定（pack 顺序决定视觉顺序：保存最底、处理贴住编辑区）
         save_group.pack(side=tk.BOTTOM, fill=tk.X)
@@ -1037,31 +1182,125 @@ class TextProcessorApp:
         messagebox.showinfo("完成", f"已合并 {len(merge_list)} 个文件到编辑区\n如需保存请使用「另存为新文件」")
 
     def split_chapters(self):
-        """按"第X章"把选中（或全部）文件分割为独立的章节文件（后台线程执行）"""
+        """按章节标题把选中（或全部）文件分割为独立章节文件（可选规则、可预览）"""
         if self._busy_guard():
             return
+        target_files = self._select_target_files("分割")
+        if not target_files:
+            return
+        self._show_chapter_split_dialog(target_files)
+
+    def _select_target_files(self, action_name):
+        """取选中文件列表；未选中时询问是否处理全部。无可用目标时返回 None（已提示）"""
         selected_indices = self.file_listbox.curselection()
         if selected_indices:
-            target_files = [self.file_list[idx] for idx in selected_indices]
-        else:
-            if not self.file_list:
-                messagebox.showinfo("提示", "请先添加文件")
-                return
-            if not messagebox.askyesno("确认", "未选择文件，是否分割所有已加载的文件？"):
-                return
-            target_files = self.file_list.copy()
+            return [self.file_list[idx] for idx in selected_indices]
+        if not self.file_list:
+            messagebox.showinfo("提示", "请先添加文件")
+            return None
+        if not messagebox.askyesno("确认", f"未选择文件，是否{action_name}所有已加载的文件？"):
+            return None
+        return self.file_list.copy()
 
-        save_dir = filedialog.askdirectory(title="选择章节文件保存目录")
-        if not save_dir:
-            return
+    def _show_chapter_split_dialog(self, target_files):
+        """章节分割设置弹窗：选择标题规则（内置/自定义正则）、预览章节、确认分割"""
+        win = tk.Toplevel(self.root)
+        win.title("分割章节")
+        win.geometry("680x560")
+        win.configure(bg=COLOR_CARD)
+        win.transient(self.root)
 
+        rule_names = list(_CHAPTER_PRESETS) + ["自定义正则"]
+        rule_frame = ttk.LabelFrame(win, text="章节标题规则", style="Card.TLabelframe")
+        rule_frame.pack(fill=tk.X, padx=10, pady=(10, 6))
+
+        rule_var = tk.StringVar(value=rule_names[0])
+        rule_combo = ttk.Combobox(rule_frame, textvariable=rule_var,
+                                  values=rule_names, state="readonly", width=22)
+        rule_combo.pack(side=tk.LEFT, padx=6, pady=6)
+
+        custom_var = tk.StringVar()
+        custom_entry = ttk.Entry(rule_frame, textvariable=custom_var)
+        custom_entry.state(["disabled"])
+        custom_entry.pack(side=tk.LEFT, padx=6, pady=6, fill=tk.X, expand=True)
+        hint_label = ttk.Label(rule_frame, text="（可先预览验证）", style="Muted.TLabel")
+        hint_label.pack(side=tk.LEFT, padx=6)
+
+        def on_rule_change(event=None):
+            is_custom = rule_var.get() == "自定义正则"
+            custom_entry.state(["!disabled"] if is_custom else ["disabled"])
+            hint_label.configure(text="如: 第\\d+章|Chapter\\s+\\d+" if is_custom else "（可先预览验证）")
+
+        rule_combo.bind("<<ComboboxSelected>>", on_rule_change)
+
+        def resolve_pattern():
+            """当前选择 -> 编译后的正则；无效返回 None（已提示）"""
+            if rule_var.get() == "自定义正则":
+                expr = custom_var.get().strip()
+                if not expr:
+                    messagebox.showwarning("提示", "请输入自定义正则表达式", parent=win)
+                    return None
+                try:
+                    return re.compile(expr)
+                except re.error as e:
+                    messagebox.showerror("错误", f"自定义正则无效：{e}", parent=win)
+                    return None
+            return re.compile(_CHAPTER_PRESETS[rule_var.get()])
+
+        preview_frame = ttk.LabelFrame(win, text="章节预览（章名 + 字数）", style="Card.TLabelframe")
+        preview_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=6)
+        preview_scroll = ttk.Scrollbar(preview_frame)
+        preview_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        preview_box = tk.Text(preview_frame, wrap=tk.WORD)
+        self._style_input_widget(preview_box, font=self.listbox_font)
+        preview_box.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
+        preview_box.config(yscrollcommand=preview_scroll.set)
+        preview_scroll.config(command=preview_box.yview)
+
+        def do_preview():
+            pattern = resolve_pattern()
+            if pattern is None:
+                return
+            preview_box.delete("1.0", tk.END)
+            found_any = False
+            for file_path in target_files:
+                blocks = split_chapters_by_pattern(self.file_contents.get(file_path, ""), pattern)
+                chapters = [(t, b) for t, b in blocks if t is not None]
+                preview_box.insert(tk.END, f"【{os.path.basename(file_path)}】识别到 {len(chapters)} 章\n")
+                for i, (t, b) in enumerate(chapters[:50], 1):
+                    preview_box.insert(tk.END, f"    {i:03d} {t}（{len(b.strip())} 字）\n")
+                if len(chapters) > 50:
+                    preview_box.insert(tk.END, f"    ...（其余 {len(chapters) - 50} 章略）\n")
+                if chapters:
+                    found_any = True
+            if not found_any:
+                preview_box.insert(tk.END, "\n未识别到任何章节标题，请调整规则后重试。\n")
+
+        def do_split():
+            pattern = resolve_pattern()
+            if pattern is None:
+                return
+            save_dir = filedialog.askdirectory(title="选择章节文件保存目录", parent=win)
+            if not save_dir:
+                return
+            win.destroy()
+            self._run_chapter_split(target_files, pattern, save_dir)
+
+        btn_bar = ttk.Frame(win, style="Page.TFrame")
+        btn_bar.pack(fill=tk.X, padx=10, pady=(0, 10))
+        ttk.Button(btn_bar, text="预览章节", command=do_preview).pack(side=tk.LEFT, padx=3)
+        ttk.Button(btn_bar, text="开始分割", command=do_split, style="Primary.TButton").pack(side=tk.LEFT, padx=3)
+        ttk.Button(btn_bar, text="取消", command=win.destroy).pack(side=tk.RIGHT, padx=3)
+
+    def _run_chapter_split(self, target_files, pattern, save_dir):
+        """后台执行章节分割：按标题写独立文件，并生成章节索引"""
         # 默认编码需在主线程预先求值（Tk 变量不能在后台线程访问）
         default_encode = self._display_to_codec(self.encode_var.get())
 
         def worker():
             q = self.task_queue
-            chapter_pattern = re.compile(r"(第[一二三四五六七八九十百千万\d]+章)")
             total_chapters = 0
+            total_indexes = 0
             step = 100 / len(target_files)
 
             for idx, file_path in enumerate(target_files):
@@ -1070,38 +1309,43 @@ class TextProcessorApp:
                     stem = os.path.splitext(os.path.basename(file_path))[0]
                     encode = self.file_encodings.get(file_path, default_encode)
 
-                    parts = chapter_pattern.split(content)
-                    if len(parts) < 3:
-                        q.put(("error", f"{os.path.basename(file_path)}：未找到\"第X章\"标题，已跳过"))
+                    blocks = split_chapters_by_pattern(content, pattern)
+                    if not any(t is not None for t, _ in blocks):
+                        q.put(("error", f"{os.path.basename(file_path)}：未识别到章节标题，已跳过"))
                         continue
 
-                    # 前言（第一章之前的内容）
-                    preface = parts[0].strip()
-                    if preface:
-                        out_path = os.path.join(save_dir, f"{stem}_00_开头.txt")
-                        with open(out_path, "w", encoding=encode) as f:
-                            f.write(preface)
+                    entries = []
+                    seq = 0
+                    for title, body in blocks:
+                        text = body.strip()
+                        if title is None:
+                            if not text:
+                                continue
+                            fname = f"{stem}_00_开头.txt"
+                            write_text = text
+                        else:
+                            seq += 1
+                            safe_title = re.sub(r'[\\/:*?"<>|\s]+', "_", title)
+                            fname = f"{stem}_{seq:03d}_{safe_title}.txt"
+                            write_text = f"{title}\n\n{text}"
+                        with open(os.path.join(save_dir, fname), "w", encoding=encode) as f:
+                            f.write(write_text)
                         total_chapters += 1
+                        entries.append(f"{fname}  （{len(text)} 字）")
 
-                    # 各章节：parts 形如 [前言, 标题1, 正文1, 标题2, 正文2, ...]
-                    for i in range(1, len(parts), 2):
-                        title = parts[i].strip()
-                        body = parts[i + 1].strip() if i + 1 < len(parts) else ""
-                        safe_title = re.sub(r'[\\/:*?"<>|\s]+', "_", title)
-                        out_path = os.path.join(
-                            save_dir, f"{stem}_{(i + 1) // 2:03d}_{safe_title}.txt")
-                        with open(out_path, "w", encoding=encode) as f:
-                            f.write(f"{title}\n\n{body}")
-                        total_chapters += 1
+                    index_name = "章节索引.txt" if len(target_files) == 1 else f"章节索引_{stem}.txt"
+                    with open(os.path.join(save_dir, index_name), "w", encoding=encode) as f:
+                        f.write(f"《{stem}》共 {len(entries)} 个文件\n\n" + "\n".join(entries))
+                    total_indexes += 1
                 except Exception as e:
                     q.put(("error", f"{os.path.basename(file_path)}：{str(e)}"))
 
                 q.put(("progress", (idx + 1) * step))
 
             q.put(("progress", 0))
-            q.put(("status", f"章节分割完成 | 共 {total_chapters} 个文件"))
+            q.put(("status", f"章节分割完成 | 共 {total_chapters} 个文件 | 索引 {total_indexes} 份"))
             if total_chapters:
-                q.put(("done_msg", f"共分割出 {total_chapters} 个章节文件\n保存于：{save_dir}"))
+                q.put(("done_msg", f"共分割出 {total_chapters} 个章节文件，生成 {total_indexes} 份章节索引\n保存于：{save_dir}"))
             else:
                 q.put(("done_msg", "没有分割出任何章节文件"))
 
@@ -1379,6 +1623,152 @@ class TextProcessorApp:
 
         return "".join(result)
 
+    # ------------------------------ 小说清洗 ------------------------------
+    def process_filter_ad_lines(self):
+        """过滤广告行：编辑关键词列表后批量删除含关键词的行（后台线程执行）"""
+        if self._busy_guard():
+            return
+        target_files = self._select_target_files("清洗")
+        if not target_files:
+            return
+        self._show_ad_filter_dialog(target_files)
+
+    def _show_ad_filter_dialog(self, target_files):
+        """广告关键词编辑弹窗：支持手动输入/从文件导入，列表随设置持久化"""
+        win = tk.Toplevel(self.root)
+        win.title("过滤广告行")
+        win.geometry("520x430")
+        win.configure(bg=COLOR_CARD)
+        win.transient(self.root)
+
+        ttk.Label(win, text="每行一个关键词，包含任一关键词的行将被删除（仅修改内存）：",
+                  style="Muted.TLabel").pack(anchor=tk.W, padx=10, pady=(10, 4))
+
+        scroll = ttk.Scrollbar(win)
+        scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        words_box = tk.Text(win, wrap=tk.WORD)
+        self._style_input_widget(words_box, font=self.listbox_font)
+        words_box.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
+        words_box.config(yscrollcommand=scroll.set)
+        scroll.config(command=words_box.yview)
+        if self.ad_filter_words:
+            words_box.insert("1.0", "\n".join(self.ad_filter_words))
+
+        whole_line_var = tk.BooleanVar(value=self.ad_whole_line)
+        ttk.Checkbutton(win, text="整行完全匹配关键词才删除（默认：包含即删）",
+                        variable=whole_line_var).pack(anchor=tk.W, padx=10, pady=2)
+
+        def import_words():
+            path = filedialog.askopenfilename(
+                title="选择关键词文件（每行一个）",
+                filetypes=[("纯文本文件", "*.txt"), ("所有文件", "*.*")])
+            if not path:
+                return
+            try:
+                content, _ = self._read_text(path, "utf-8")
+                existing = [w.strip() for w in words_box.get("1.0", "end-1c").splitlines()]
+                merged = [w for w in existing + [w2.strip() for w2 in content.splitlines()] if w]
+                seen = set()
+                merged = [w for w in merged if not (w in seen or seen.add(w))]
+                words_box.delete("1.0", tk.END)
+                words_box.insert("1.0", "\n".join(merged))
+            except Exception as e:
+                messagebox.showerror("错误", f"读取关键词文件失败：{e}", parent=win)
+
+        def confirm():
+            words = []
+            seen = set()
+            for w in words_box.get("1.0", "end-1c").splitlines():
+                w = w.strip()
+                if w and w not in seen:
+                    seen.add(w)
+                    words.append(w)
+            self.ad_filter_words = words
+            self.ad_whole_line = whole_line_var.get()
+            self.save_settings()
+            win.destroy()
+            if not words:
+                messagebox.showinfo("提示", "关键词列表为空，未执行过滤")
+                return
+            self._run_filter_ad_lines(target_files, words, self.ad_whole_line)
+
+        btn_bar = ttk.Frame(win, style="Page.TFrame")
+        btn_bar.pack(fill=tk.X, padx=10, pady=(0, 10))
+        ttk.Button(btn_bar, text="从文件导入", command=import_words).pack(side=tk.LEFT, padx=3)
+        ttk.Button(btn_bar, text="确定", command=confirm, style="Primary.TButton").pack(side=tk.RIGHT, padx=3)
+        ttk.Button(btn_bar, text="取消", command=win.destroy).pack(side=tk.RIGHT, padx=3)
+
+    def _run_filter_ad_lines(self, target_files, keywords, whole_line):
+        """后台执行广告行过滤，统计各文件删除行数"""
+        def worker():
+            q = self.task_queue
+            total_removed = 0
+            files_hit = 0
+            step = 100 / len(target_files)
+            for idx, file_path in enumerate(target_files):
+                try:
+                    content = self.file_contents.get(file_path, "")
+                    new_content, removed = filter_ad_lines(content, keywords, whole_line)
+                    if removed:
+                        self.file_contents[file_path] = new_content
+                        total_removed += removed
+                        files_hit += 1
+                except Exception as e:
+                    q.put(("error", f"{os.path.basename(file_path)}：{str(e)}"))
+                q.put(("progress", (idx + 1) * step))
+
+            q.put(("progress", 0))
+            q.put(("status", f"广告过滤完成 | {files_hit}/{len(target_files)} 个文件命中 | "
+                             f"共删除 {total_removed} 行（仅修改内存，需手动保存）"))
+            q.put(("done_msg", f"{files_hit}/{len(target_files)} 个文件命中\n共删除 {total_removed} 行"))
+
+        self._start_task(worker)
+
+    def process_dedup_chapters(self):
+        """章节去重：识别章节后剔除完全重复/同标题正文高度相似的章节（后台线程执行）"""
+        if self._busy_guard():
+            return
+        target_files = self._select_target_files("去重")
+        if not target_files:
+            return
+        pattern = re.compile(_CHAPTER_PRESETS["第X章+序章/楔子/番外"])
+
+        def worker():
+            q = self.task_queue
+            total_removed = 0
+            files_hit = 0
+            summary = []
+            step = 100 / len(target_files)
+            for idx, file_path in enumerate(target_files):
+                try:
+                    content = self.file_contents.get(file_path, "")
+                    blocks = split_chapters_by_pattern(content, pattern)
+                    if sum(1 for t, _ in blocks if t is not None) < 2:
+                        q.put(("error", f"{os.path.basename(file_path)}：未识别到章节（或仅一章），已跳过"))
+                        continue
+                    kept, removed = dedup_chapter_blocks(blocks)
+                    if removed:
+                        rebuilt = "\n\n".join(
+                            f"{t}\n\n{b.strip()}" if t is not None else b.strip()
+                            for t, b in kept if b.strip())
+                        self.file_contents[file_path] = rebuilt
+                        total_removed += len(removed)
+                        files_hit += 1
+                        summary.append(f"{os.path.basename(file_path)}：剔除 {len(removed)} 章，如 {removed[0]}")
+                except Exception as e:
+                    q.put(("error", f"{os.path.basename(file_path)}：{str(e)}"))
+                q.put(("progress", (idx + 1) * step))
+
+            q.put(("progress", 0))
+            q.put(("status", f"章节去重完成 | {files_hit}/{len(target_files)} 个文件命中 | "
+                             f"共剔除 {total_removed} 章（仅修改内存，需手动保存）"))
+            if summary:
+                q.put(("done_msg", f"共剔除 {total_removed} 章\n" + "\n".join(summary[:10])))
+            else:
+                q.put(("done_msg", "未发现重复章节"))
+
+        self._start_task(worker)
+
     # ------------------------------ 内容提取 ------------------------------
     def extract_emails(self):
         """提取邮箱地址"""
@@ -1481,6 +1871,11 @@ class TextProcessorApp:
 
         messagebox.showinfo("字数统计", stats_message)
 
+    def _newline_mode(self):
+        """换行符选项 -> open() 的 newline 参数（None 表示系统默认）"""
+        return {"默认": None, "LF (Unix)": "\n", "CRLF (Windows)": "\r\n"}.get(
+            self.newline_var.get(), None)
+
     def save_to_original_files(self):
         """保存处理后的内容到原文件（覆盖，自动生成一次 .bak 备份，后台线程执行）"""
         if self._busy_guard():
@@ -1508,8 +1903,9 @@ class TextProcessorApp:
         if not confirm:
             return
 
-        # 默认编码需在主线程预先求值（Tk 变量不能在后台线程访问）
+        # 默认编码与换行符需在主线程预先求值（Tk 变量不能在后台线程访问）
         default_encode = self._display_to_codec(self.encode_var.get())
+        newline = self._newline_mode()
 
         def worker():
             q = self.task_queue
@@ -1520,15 +1916,13 @@ class TextProcessorApp:
                 try:
                     encode = self.file_encodings.get(file_path, default_encode)
 
-                    # 生成一次 .bak 备份（此时磁盘上仍是原始内容）
+                    # 生成一次 .bak 备份（按字节复制，原样保留原始内容与换行）
                     backup_path = file_path + ".bak"
                     if not os.path.exists(backup_path):
-                        with open(file_path, "r", encoding=encode) as bf:
-                            original = bf.read()
-                        with open(backup_path, "w", encoding=encode) as bf:
-                            bf.write(original)
+                        with open(file_path, "rb") as src, open(backup_path, "wb") as dst:
+                            dst.write(src.read())
 
-                    with open(file_path, "w", encoding=encode) as f:
+                    with open(file_path, "w", encoding=encode, newline=newline) as f:
                         f.write(self.file_contents.get(file_path, ""))
                     success_count += 1
                 except Exception as e:
@@ -1561,7 +1955,7 @@ class TextProcessorApp:
 
         try:
             encode = self._display_to_codec(self.encode_var.get())
-            with open(file_path, "w", encoding=encode) as f:
+            with open(file_path, "w", encoding=encode, newline=self._newline_mode()) as f:
                 f.write(current_text)
 
             # 将新文件添加到列表
