@@ -50,6 +50,13 @@
      python 全能TXT文本处理器.py epub 小说.txt --out 小说.epub --author 某某 --cover cover.jpg
      python 全能TXT文本处理器.py dedup 小说.txt --in-place
 
+2.6 新增：
+ 25. 新增「生成报告」：单文件 HTML 可视化统计报告（内嵌 CSS + SVG 图表，离线可用）——
+     概览卡片（字数/章节/阅读时长/对话占比）、章节字数分布图、高频汉字 Top30（剔除虚词）、
+     高频双字组合、标点使用统计；柱状图悬停可看数值
+ 26. EPUB 正文排版升级：衬线字体栈 + 两端对齐
+ 27. CLI 新增 stats 子命令：默认打印 JSON 统计概览（便于脚本/其他程序消费），--out 生成 HTML 报告
+
 所有处理仅修改内存，需手动"保存到原文件"或"另存为新文件"才会写盘。
 运行依赖：tkinterdnd2（可选，pip install tkinterdnd2，用于拖放）
 """
@@ -58,6 +65,7 @@ import argparse
 import difflib
 import html
 import json
+import math
 import os
 import queue
 import re
@@ -66,6 +74,7 @@ import threading
 import time
 import uuid
 import zipfile
+from collections import Counter
 import tkinter as tk
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
@@ -76,7 +85,7 @@ except ImportError:
     DND_AVAILABLE = False
 
 # 默认窗口标题
-DEFAULT_TITLE = "全能TXT文本处理器 2.5"
+DEFAULT_TITLE = "全能TXT文本处理器 2.6"
 
 # ------------------------------ 界面主题配色（扁平化浅色主题） ------------------------------
 COLOR_BG        = "#EEF1F5"   # 页面背景
@@ -298,9 +307,10 @@ def chapter_xhtml(title, body):
 
 
 _EPUB_CSS = (
-    "body { margin: 5% 8%; font-family: serif; line-height: 1.8; }\n"
-    "h2 { text-align: center; margin: 1.5em 0; font-size: 1.2em; }\n"
-    "p { text-indent: 2em; margin: 0.3em 0; }\n"
+    "body { margin: 5% 8%; line-height: 1.9; text-align: justify;\n"
+    "  font-family: 'Noto Serif CJK SC', 'Source Han Serif SC', 'SimSun', serif; }\n"
+    "h2 { text-align: center; margin: 1.6em 0 1.2em; font-size: 1.25em; }\n"
+    "p { text-indent: 2em; margin: 0.35em 0; }\n"
 )
 
 
@@ -458,6 +468,213 @@ def read_text_smart(path, chosen_display):
         except LookupError:
             continue  # 当前平台不支持的编码，尝试下一个
     raise last_err if last_err else OSError("无法识别文件编码")
+
+
+# ------------------------------ 文本统计与可视化报告 ------------------------------
+# 报告为单文件 HTML（内嵌 CSS + SVG 图表），纯标准库生成，离线可用
+_CJK_STOPCHARS = set(
+    "的了是我不他她在有和就都不人一这也要上说没有来着到去看好对过自吗里后大之中为个你什么地得着那还吧")
+_DIALOGUE_QUOTES = "“”\"「『"
+
+
+def compute_text_stats(text):
+    """文本基础统计：字数、行数、对话行占比、预计阅读时长等"""
+    lines = text.split("\n")
+    nonempty = [line for line in lines if line.strip()]
+    cjk_count = sum(1 for ch in text if "\u4e00" <= ch <= "\u9fff")
+    dialogue = sum(1 for line in nonempty if any(q in line for q in _DIALOGUE_QUOTES))
+    return {
+        "total_chars": len(text),
+        "chars_no_space": len(re.sub(r"\s", "", text)),
+        "cjk_chars": cjk_count,
+        "lines": len(lines),
+        "nonempty_lines": len(nonempty),
+        "dialogue_lines": dialogue,
+        "reading_minutes": max(1, round(cjk_count / 500)),
+    }
+
+
+def top_cjk_unigrams(text, top=30):
+    """高频汉字 Top N（剔除常见虚词，让结果更有信息量）"""
+    cnt = Counter(ch for ch in text
+                  if "\u4e00" <= ch <= "\u9fff" and ch not in _CJK_STOPCHARS)
+    return cnt.most_common(top)
+
+
+def top_cjk_bigrams(text, top=15):
+    """相邻汉字二元组合 Top N（粗粒度高频词，如人名/地名/口头禅）"""
+    cnt = Counter()
+    prev = ""
+    for ch in text:
+        if "\u4e00" <= ch <= "\u9fff":
+            if prev:
+                cnt[prev + ch] += 1
+            prev = ch
+        else:
+            prev = ""
+    return cnt.most_common(top)
+
+
+def bucket_series(items, max_bars=100):
+    """把 [(标签, 数值)] 聚合到最多 max_bars 个桶（取平均），供图表降采样。
+    返回 [(新标签, 平均值)]。"""
+    if len(items) <= max_bars:
+        return list(items)
+    bucket_size = math.ceil(len(items) / max_bars)
+    out = []
+    for start in range(0, len(items), bucket_size):
+        group = items[start:start + bucket_size]
+        label = (f"{start + 1}-{start + len(group)}" if len(group) > 1 else f"{start + 1}")
+        out.append((label, round(sum(v for _, v in group) / len(group))))
+    return out
+
+
+def svg_vbars(items, width=880, height=260, color="#2563EB"):
+    """纵向柱状图 SVG（矩形内嵌 <title> 提供原生悬停提示）"""
+    if not items:
+        return ""
+    n = len(items)
+    pad_l, pad_b, pad_t = 10, 24, 16
+    plot_w, plot_h = width - pad_l * 2, height - pad_b - pad_t
+    vmax = max(v for _, v in items) or 1
+    slot = plot_w / n
+    bar_w = max(2, min(40, slot * 0.72))
+    parts = [f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" '
+             f'viewBox="0 0 {width} {height}" role="img">']
+    step = max(1, math.ceil(n / 16))
+    for i, (label, v) in enumerate(items):
+        x = pad_l + i * slot + (slot - bar_w) / 2
+        h = plot_h * v / vmax
+        y = pad_t + plot_h - h
+        parts.append(f'<rect x="{x:.1f}" y="{y:.1f}" width="{bar_w:.1f}" height="{h:.1f}" '
+                     f'rx="2" fill="{color}" class="bar"><title>{html.escape(str(label))}：{v}</title></rect>')
+        if i % step == 0:
+            short = html.escape(str(label))[:8]
+            parts.append(f'<text x="{x + bar_w / 2:.1f}" y="{height - 7}" font-size="10" '
+                         f'text-anchor="middle" fill="#6B7280">{short}</text>')
+    parts.append(f'<line x1="{pad_l}" y1="{pad_t + plot_h}" x2="{width - pad_l}" '
+                 f'y2="{pad_t + plot_h}" stroke="#D9DEE7"/>')
+    parts.append("</svg>")
+    return "".join(parts)
+
+
+def svg_hbars(items, width=880, color="#2563EB"):
+    """横向条形图 SVG（用于字频等标签较长的场景）"""
+    if not items:
+        return ""
+    row_h = 26
+    height = len(items) * row_h + 12
+    label_w, val_w = 130, 70
+    bar_x, bar_max = label_w + 10, width - label_w - 10 - val_w
+    vmax = max(v for _, v in items) or 1
+    parts = [f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" '
+             f'viewBox="0 0 {width} {height}" role="img">']
+    for i, (label, v) in enumerate(items):
+        y = 8 + i * row_h
+        bh = row_h - 9
+        short = html.escape(str(label))[:6]
+        bar_w = max(2, bar_max * v / vmax)
+        parts.append(f'<text x="0" y="{y + bh * 0.85:.1f}" font-size="13" fill="#1F2937">{short}</text>')
+        parts.append(f'<rect x="{bar_x}" y="{y}" width="{bar_w:.1f}" height="{bh}" rx="3" '
+                     f'fill="{color}" class="bar"><title>{html.escape(str(label))}：{v} 次</title></rect>')
+        parts.append(f'<text x="{bar_x + bar_w + 6:.1f}" y="{y + bh * 0.85:.1f}" font-size="12" '
+                     f'fill="#6B7280">{v}</text>')
+    parts.append("</svg>")
+    return "".join(parts)
+
+
+_REPORT_CSS = """
+:root { --primary:#2563EB; --bg:#EEF1F5; --card:#FFFFFF; --border:#D9DEE7;
+        --text:#1F2937; --muted:#6B7280; }
+* { box-sizing: border-box; }
+body { margin: 0; padding: 28px 20px 40px; background: var(--bg); color: var(--text);
+       font-family: "Microsoft YaHei UI", "PingFang SC", "Noto Sans CJK SC", sans-serif; }
+.wrap { max-width: 960px; margin: 0 auto; }
+h1 { font-size: 22px; margin: 0 0 4px; }
+.meta { color: var(--muted); font-size: 12px; margin-bottom: 20px; }
+.cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+         gap: 12px; margin-bottom: 20px; }
+.card { background: var(--card); border: 1px solid var(--border); border-radius: 10px;
+        padding: 14px 16px; }
+.card .num { font-size: 24px; font-weight: 700; color: var(--primary); }
+.card .lab { font-size: 12px; color: var(--muted); margin-top: 2px; }
+section { background: var(--card); border: 1px solid var(--border); border-radius: 10px;
+          padding: 18px 20px; margin-bottom: 20px; }
+section h2 { font-size: 15px; margin: 0 0 12px; color: var(--primary); }
+section p.desc { font-size: 12px; color: var(--muted); margin: -6px 0 12px; }
+svg { width: 100%; height: auto; display: block; }
+.bar:hover { opacity: 0.75; }
+table { width: 100%; border-collapse: collapse; font-size: 13px; }
+td, th { padding: 7px 10px; border-bottom: 1px solid var(--border); text-align: left; }
+th { color: var(--muted); font-weight: 500; }
+footer { text-align: center; color: var(--muted); font-size: 12px; margin-top: 8px; }
+"""
+
+
+def build_text_report(text, book_title, pattern):
+    """生成完整 HTML 统计报告字符串（pattern 用于识别章节）"""
+    stats = compute_text_stats(text)
+    blocks = split_chapters_by_pattern(text, pattern)
+    chapter_items = [(t, len(b.strip())) for t, b in blocks if t is not None]
+    shown = bucket_series(chapter_items)
+    unigrams = top_cjk_unigrams(text, 30)
+    bigrams = top_cjk_bigrams(text, 15)
+
+    def card(num, lab):
+        return f'<div class="card"><div class="num">{num}</div><div class="lab">{lab}</div></div>'
+
+    overview = "".join([
+        card(f"{stats['chars_no_space']:,}", "总字数（不含空白）"),
+        card(f"{stats['cjk_chars']:,}", "中文字符"),
+        card(f"{stats['nonempty_lines']:,}", "非空行"),
+        card(str(len(chapter_items)) or "—", "章节数"),
+        card(f"{stats['reading_minutes']} 分钟", "预计阅读时长（500字/分）"),
+        card(f"{stats['dialogue_lines'] / max(1, stats['nonempty_lines']):.0%}", "对话行占比"),
+    ])
+
+    puncts = {p: text.count(p) for p in "。，！？；：""''……——"}
+    punct_rows = "".join(
+        f"<tr><td>{html.escape(p)}</td><td>{n:,}</td></tr>"
+        for p, n in sorted(puncts.items(), key=lambda kv: -kv[1])[:8])
+
+    chapter_section = (
+        '<section><h2>章节字数分布</h2>'
+        + (f'<p class="desc">共 {len(chapter_items)} 章，每格为约 {math.ceil(len(chapter_items) / 100)} 章的平均字数</p>'
+           if len(chapter_items) > 100 else
+           (f'<p class="desc">共 {len(chapter_items)} 章</p>' if chapter_items else
+            '<p class="desc">未识别到章节标题</p>'))
+        + (svg_vbars(shown) if shown else "")
+        + "</section>")
+
+    uni_svg = svg_hbars(unigrams)
+    bi_rows = "".join(
+        f"<tr><td>{html.escape(w)}</td><td>{n:,}</td></tr>" for w, n in bigrams)
+
+    return f"""<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<title>{html.escape(book_title)} · 统计报告</title>
+<style>{_REPORT_CSS}</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>{html.escape(book_title)} · 文本统计报告</h1>
+  <div class="meta">生成于 {time.strftime("%Y-%m-%d %H:%M")} · 共 {stats['total_chars']:,} 字符</div>
+  <div class="cards">{overview}</div>
+  {chapter_section}
+  <section><h2>高频汉字 Top {len(unigrams)}</h2>
+    <p class="desc">已剔除"的了是在"等虚词，反映用字偏好</p>
+    {uni_svg}</section>
+  <section><h2>高频双字组合 Top {len(bigrams)}</h2>
+    <p class="desc">相邻汉字组合，通常对应人名、地名、口头禅</p>
+    <table><tr><th>组合</th><th>出现次数</th></tr>{bi_rows}</table></section>
+  <section><h2>标点使用</h2>
+    <table><tr><th>标点</th><th>次数</th></tr>{punct_rows}</table></section>
+  <footer>全能TXT文本处理器 2.6 本地生成 · 数据未离开本机</footer>
+</div>
+</body>
+</html>"""
 
 
 class TextProcessorApp:
@@ -746,7 +963,7 @@ class TextProcessorApp:
         header_inner.pack(fill=tk.X, padx=14, pady=8)
         tk.Label(header_inner, text="全能TXT文本处理器", bg=COLOR_PRIMARY, fg="#FFFFFF",
                  font=(face, 15, "bold")).pack(side=tk.LEFT)
-        tk.Label(header_inner, text="v2.5 · 仅修改内存 · 手动保存", bg=COLOR_PRIMARY,
+        tk.Label(header_inner, text="v2.6 · 仅修改内存 · 手动保存", bg=COLOR_PRIMARY,
                  fg="#BFDBFE", font=(face, 9)).pack(side=tk.LEFT, padx=(10, 0), pady=(4, 0))
         self.busy_label = tk.Label(header_inner, text="", bg=COLOR_PRIMARY, fg="#FDE68A",
                                    font=(face, 10, "bold"))
@@ -957,6 +1174,7 @@ class TextProcessorApp:
         btn_frame4 = ttk.Frame(save_group)
         btn_frame4.pack(fill=tk.X, pady=(6, 2), padx=4)
         ttk.Button(btn_frame4, text="统计字数", command=self.count_text_words).pack(side=tk.LEFT, padx=3, pady=2)
+        self._action_button(btn_frame4, "生成报告", self.generate_report)
         self._action_button(btn_frame4, "保存到原文件", self.save_to_original_files, style="Primary.TButton")
         self._action_button(btn_frame4, "另存为新文件", self.save_as_new_file)
 
@@ -2269,6 +2487,52 @@ class TextProcessorApp:
         return {"默认": None, "LF (Unix)": "\n", "CRLF (Windows)": "\r\n"}.get(
             self.newline_var.get(), None)
 
+    def generate_report(self):
+        """为选中（或全部）文件生成单文件 HTML 可视化统计报告（后台线程执行）"""
+        if self._busy_guard():
+            return
+        target_files = self._select_target_files("生成报告")
+        if not target_files:
+            return
+        if len(target_files) == 1:
+            default_name = os.path.splitext(os.path.basename(target_files[0]))[0] + "_报告.html"
+        else:
+            default_name = "批量统计报告.html"
+        out_path = filedialog.asksaveasfilename(
+            title="保存统计报告", defaultextension=".html", initialfile=default_name,
+            filetypes=[("HTML 报告", "*.html"), ("所有文件", "*.*")])
+        if not out_path:
+            return
+        pattern = re.compile(_CHAPTER_PRESETS["第X章+序章/楔子/番外"])
+
+        def worker():
+            q = self.task_queue
+            out_ext = os.path.splitext(out_path)[1] or ".html"
+            out_dir = os.path.dirname(out_path)
+            done = 0
+            for idx, file_path in enumerate(target_files):
+                try:
+                    content = self.file_contents.get(file_path, "")
+                    stem = os.path.splitext(os.path.basename(file_path))[0]
+                    report = build_text_report(content, stem, pattern)
+                    if len(target_files) == 1:
+                        out = out_path
+                    else:
+                        out = os.path.join(out_dir, f"{stem}_报告{out_ext}")
+                    with open(out, "w", encoding="utf-8") as f:
+                        f.write(report)
+                    done += 1
+                    q.put(("status", f"已生成报告：{os.path.basename(out)}"))
+                except Exception as e:
+                    q.put(("error", f"{os.path.basename(file_path)}：{str(e)}"))
+                q.put(("progress", (idx + 1) * 100 / len(target_files)))
+
+            q.put(("progress", 0))
+            q.put(("status", f"统计报告完成 | 成功 {done}/{len(target_files)} 份"))
+            q.put(("done_msg", f"已生成 {done} 份 HTML 报告\n浏览器直接打开即可查看"))
+
+        self._start_task(worker)
+
     def save_to_original_files(self):
         """保存处理后的内容到原文件（覆盖，自动生成一次 .bak 备份，后台线程执行）"""
         if self._busy_guard():
@@ -2587,7 +2851,7 @@ class TextProcessorApp:
 
 # ------------------------------ 命令行模式 ------------------------------
 # 不启动界面，便于脚本化批量处理；不带参数运行仍是图形界面
-_CLI_COMMANDS = {"split", "epub", "dedup", "sort", "adfilter", "convert"}
+_CLI_COMMANDS = {"split", "epub", "dedup", "sort", "adfilter", "convert", "stats"}
 
 
 def _cli_inplace_write(path, content, encode):
@@ -2746,6 +3010,25 @@ def _cli_cmd_convert(args):
     return 0
 
 
+def _cli_cmd_stats(args):
+    content, _ = read_text_smart(args.file, args.encoding)
+    stem = os.path.splitext(os.path.basename(args.file))[0]
+    pattern = (re.compile(args.pattern) if args.pattern
+               else re.compile(_CHAPTER_PRESETS[args.preset]))
+    if args.out:
+        report = build_text_report(content, stem, pattern)
+        with open(args.out, "w", encoding="utf-8") as f:
+            f.write(report)
+        print(f"已生成 HTML 报告：{args.out}")
+        return 0
+    blocks = split_chapters_by_pattern(content, pattern)
+    stats = compute_text_stats(content)
+    stats["chapters"] = sum(1 for t, _ in blocks if t is not None)
+    print(json.dumps({"file": os.path.basename(args.file), "title": stem, **stats},
+                     ensure_ascii=False, indent=2))
+    return 0
+
+
 def build_cli_parser():
     parser = argparse.ArgumentParser(
         prog="全能TXT文本处理器",
@@ -2800,6 +3083,15 @@ def build_cli_parser():
     p.add_argument("--outdir", default=None, help="输出目录（缺省当前目录；--in-place 时忽略）")
     p.add_argument("--in-place", action="store_true", help="覆盖原文件（自动 .bak 备份）")
     p.set_defaults(func=_cli_cmd_convert)
+
+    p = sub.add_parser("stats", help="文本统计：默认打印 JSON 概览，--out 生成 HTML 可视化报告")
+    p.add_argument("file", help="TXT 文件")
+    p.add_argument("--out", default=None, help="输出 HTML 报告路径（缺省打印 JSON）")
+    p.add_argument("--preset", default="第X章+序章/楔子/番外",
+                   choices=list(_CHAPTER_PRESETS), help="章节规则（影响章节数统计）")
+    p.add_argument("--pattern", default=None, help="自定义章节标题正则（优先于 --preset）")
+    p.add_argument("--encoding", default="utf-8")
+    p.set_defaults(func=_cli_cmd_stats)
 
     return parser
 

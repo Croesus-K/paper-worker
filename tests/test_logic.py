@@ -352,6 +352,74 @@ class TestCli(unittest.TestCase):
             self.assertNotIn(b"\xef\xbb\xbf", raw)  # utf-8 BOM 应已去除
             raw.decode("gbk")  # 能按 GBK 解码
 
+    def test_cli_stats_json_and_html(self):
+        import tempfile, json as jsonmod
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "书.txt")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(TestStats.SAMPLE)
+            r = self._run("stats", path, "--encoding", "utf-8")
+            self.assertEqual(r.returncode, 0, r.stderr)
+            data = jsonmod.loads(r.stdout)
+            self.assertEqual(data["chapters"], 3)
+            self.assertEqual(data["title"], "书")
+
+            out = os.path.join(d, "报告.html")
+            r2 = self._run("stats", path, "--out", out)
+            self.assertEqual(r2.returncode, 0, r2.stderr)
+            html_text = open(out, encoding="utf-8").read()
+            self.assertIn("<svg", html_text)
+
+
+class TestStats(unittest.TestCase):
+    SAMPLE = ('第一章 起\n主角说："这是正文内容。"\n\n第二章 承\n江湖风波再起。\n'
+              '第三章 转\n一路向西，遇见故人。\n')
+
+    def test_compute_text_stats(self):
+        s = processor.compute_text_stats(self.SAMPLE)
+        self.assertEqual(s["lines"], 8)               # 含末尾换行产生的空行
+        self.assertEqual(s["nonempty_lines"], 6)
+        self.assertGreater(s["cjk_chars"], 0)
+        self.assertEqual(s["dialogue_lines"], 1)      # 含中文引号的一行
+        self.assertGreaterEqual(s["reading_minutes"], 1)
+
+    def test_top_unigrams_excludes_stopchars(self):
+        uni = processor.top_cjk_unigrams(self.SAMPLE, 10)
+        self.assertTrue(all(ch not in processor._CJK_STOPCHARS for ch, _ in uni))
+        labels = [ch for ch, _ in uni]
+        self.assertIn("主", labels)
+
+    def test_bigrams(self):
+        bi = processor.top_cjk_bigrams(self.SAMPLE, 10)
+        self.assertTrue(all(len(w) == 2 for w, _ in bi))
+
+    def test_bucket_series(self):
+        items = [(str(i), i) for i in range(1, 251)]  # 250 章
+        buckets = processor.bucket_series(items, max_bars=100)
+        self.assertLessEqual(len(buckets), 100)
+        # 前 3 章聚合为均值 2，末尾不满一桶时按实际均值
+        self.assertEqual(buckets[0], ("1-3", 2))
+        self.assertEqual(buckets[-1], ("250", 250))
+        # 不需要聚合时原样返回
+        self.assertEqual(processor.bucket_series([("a", 1), ("b", 2)], max_bars=100),
+                         [("a", 1), ("b", 2)])
+
+    def test_svg_charts(self):
+        bars = processor.svg_vbars([("第一章", 100), ("第二章", 60)])
+        self.assertIn("<svg", bars)
+        self.assertIn("<title>第一章：100</title>", bars)
+        hbars = processor.svg_hbars([("测", 5)])
+        self.assertIn('fill="#2563EB"', hbars)
+
+    def test_report_html(self):
+        pattern = re.compile(processor._CHAPTER_PRESETS["第X章"])
+        report = processor.build_text_report(self.SAMPLE, "书名<测试>", pattern)
+        self.assertIn("统计报告", report)
+        self.assertIn("<svg", report)
+        self.assertIn("书名&lt;测试&gt;", report)   # 标题已转义
+        self.assertIn("高频汉字", report)
+        self.assertIn("数据未离开本机", report)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
