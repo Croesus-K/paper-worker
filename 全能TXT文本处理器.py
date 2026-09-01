@@ -57,6 +57,12 @@
  26. EPUB 正文排版升级：衬线字体栈 + 两端对齐
  27. CLI 新增 stats 子命令：默认打印 JSON 统计概览（便于脚本/其他程序消费），--out 生成 HTML 报告
 
+2.7 新增：
+ 28. 新增 十六进制查看：弹窗显示文件开头字节的 hex 转储，附"编码体检"（BOM/UTF-8 合法性/GBK 兜底），
+     排查乱码根源；CLI 同步提供 hex 子命令
+ 29. 新增 比较文件：选中恰好两个文件生成彩色 HTML 差异报告（红删绿增）并用浏览器打开；
+     CLI 提供 diff 子命令（--out 生成 HTML）
+
 所有处理仅修改内存，需手动"保存到原文件"或"另存为新文件"才会写盘。
 运行依赖：tkinterdnd2（可选，pip install tkinterdnd2，用于拖放）
 """
@@ -70,9 +76,11 @@ import os
 import queue
 import re
 import sys
+import tempfile
 import threading
 import time
 import uuid
+import webbrowser
 import zipfile
 from collections import Counter
 import tkinter as tk
@@ -85,7 +93,7 @@ except ImportError:
     DND_AVAILABLE = False
 
 # 默认窗口标题
-DEFAULT_TITLE = "全能TXT文本处理器 2.6"
+DEFAULT_TITLE = "全能TXT文本处理器 2.7"
 
 # ------------------------------ 界面主题配色（扁平化浅色主题） ------------------------------
 COLOR_BG        = "#EEF1F5"   # 页面背景
@@ -677,6 +685,98 @@ def build_text_report(text, book_title, pattern):
 </html>"""
 
 
+# ------------------------------ 十六进制查看与文件比较 ------------------------------
+_HEX_VIEW_BYTES = 65536  # 十六进制查看默认最多显示的字节数
+
+
+def hex_dump(data, width=16):
+    """字节串 -> 十六进制转储文本（偏移量 | 十六进制 | ASCII，不可见字符显示为·）"""
+    lines = []
+    for off in range(0, len(data), width):
+        chunk = data[off:off + width]
+        hexpart = " ".join(f"{b:02X}" for b in chunk)
+        asciipart = "".join(chr(b) if 32 <= b < 127 else "·" for b in chunk)
+        lines.append(f"{off:08X}  {hexpart:<{width * 3 - 1}}  {asciipart}")
+    return "\n".join(lines)
+
+
+def detect_encoding_hints(data):
+    """对文件头字节做编码体检，返回提示列表（帮助判断乱码根源）"""
+    hints = []
+    if data.startswith(b"\xef\xbb\xbf"):
+        hints.append("带 UTF-8 BOM")
+    elif data.startswith(b"\xff\xfe") or data.startswith(b"\xfe\xff"):
+        hints.append("带 UTF-16 BOM")
+    try:
+        data.decode("utf-8")
+        hints.append("是合法 UTF-8")
+    except UnicodeDecodeError:
+        hints.append("不是合法 UTF-8（可能为 GBK/ANSI 或文件损坏）")
+        try:
+            data.decode("gbk")
+            hints.append("可按 GBK 解码")
+        except UnicodeDecodeError:
+            hints.append("也无法按 GBK 解码")
+    return hints
+
+
+_DIFF_CSS = """
+body { margin: 24px; background: #EEF1F5; color: #1F2937;
+       font-family: Consolas, "Courier New", monospace; font-size: 13px; }
+h1 { font-family: "Microsoft YaHei UI", sans-serif; font-size: 18px; }
+.meta { font-family: "Microsoft YaHei UI", sans-serif; color: #6B7280;
+        font-size: 12px; margin-bottom: 16px; }
+.card { background: #FFFFFF; border: 1px solid #D9DEE7; border-radius: 10px;
+        padding: 12px 0; overflow-x: auto; }
+div.line { padding: 1px 14px; white-space: pre; }
+.add { background: #E6F4EA; color: #1A7F37; }
+.del { background: #FDE8E8; color: #C0392B; }
+.info { background: #DBEAFE; color: #1D4ED8; font-weight: bold; }
+footer { font-family: "Microsoft YaHei UI", sans-serif; text-align: center;
+         color: #6B7280; font-size: 12px; margin-top: 12px; }
+"""
+
+
+def unified_diff_html(title_a, title_b, a_text, b_text, context=3):
+    """两段文本的行级差异 -> 彩色 HTML 报告（删除行红底、新增行绿底）"""
+    diff_lines = list(difflib.unified_diff(
+        a_text.splitlines(), b_text.splitlines(),
+        fromfile=title_a, tofile=title_b, lineterm="", n=context))
+    rows = []
+    changed = added = removed = 0
+    for line in diff_lines:
+        if line.startswith("---") or line.startswith("+++"):
+            continue
+        esc = html.escape(line)
+        if line.startswith("@@"):
+            rows.append(f'<div class="line info">{esc}</div>')
+        elif line.startswith("-"):
+            removed += 1
+            rows.append(f'<div class="line del">{esc}</div>')
+        elif line.startswith("+"):
+            added += 1
+            rows.append(f'<div class="line add">{esc}</div>')
+        else:
+            rows.append(f'<div class="line">{esc or " "}</div>')
+    changed = added + removed
+    meta = (f"{html.escape(title_a)} vs {html.escape(title_b)} · "
+            f"+{added} 行 / -{removed} 行（共 {changed} 处变动）")
+    return f"""<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<title>文件对比：{html.escape(title_a)} vs {html.escape(title_b)}</title>
+<style>{_DIFF_CSS}</style>
+</head>
+<body>
+<h1>文件对比报告</h1>
+<div class="meta">{meta}</div>
+<div class="card">{"".join(rows) or '<div class="line">两个文件内容完全一致</div>'}</div>
+<footer>全能TXT文本处理器 2.7 本地生成 · 数据未离开本机</footer>
+</body>
+</html>"""
+
+
 class TextProcessorApp:
     def __init__(self, root):
         self.root = root
@@ -963,7 +1063,7 @@ class TextProcessorApp:
         header_inner.pack(fill=tk.X, padx=14, pady=8)
         tk.Label(header_inner, text="全能TXT文本处理器", bg=COLOR_PRIMARY, fg="#FFFFFF",
                  font=(face, 15, "bold")).pack(side=tk.LEFT)
-        tk.Label(header_inner, text="v2.6 · 仅修改内存 · 手动保存", bg=COLOR_PRIMARY,
+        tk.Label(header_inner, text="v2.7 · 仅修改内存 · 手动保存", bg=COLOR_PRIMARY,
                  fg="#BFDBFE", font=(face, 9)).pack(side=tk.LEFT, padx=(10, 0), pady=(4, 0))
         self.busy_label = tk.Label(header_inner, text="", bg=COLOR_PRIMARY, fg="#FDE68A",
                                    font=(face, 10, "bold"))
@@ -1064,6 +1164,8 @@ class TextProcessorApp:
         tools_btn_frame2 = ttk.Frame(file_tools_group)
         tools_btn_frame2.pack(fill=tk.X, pady=(2, 6))
         self._action_button(tools_btn_frame2, "导出EPUB", self.export_epub)
+        self._action_button(tools_btn_frame2, "十六进制查看", self.show_hex_viewer)
+        self._action_button(tools_btn_frame2, "比较文件", self.compare_files)
 
         # 文件列表（吃剩余空间，小窗口时缩列表而不是裁按钮）
         self.list_group = ttk.LabelFrame(left_frame, text="已加载文件列表（0）",
@@ -1972,6 +2074,76 @@ class TextProcessorApp:
 
         self._start_task(worker)
 
+    def show_hex_viewer(self):
+        """以十六进制查看选中文件的开头字节，附编码体检提示（排查乱码根源）"""
+        selected = self.file_listbox.curselection()
+        if not selected:
+            messagebox.showinfo("提示", "请先在列表中选中一个文件")
+            return
+        file_path = self.file_list[selected[0]]
+        try:
+            with open(file_path, "rb") as f:
+                data = f.read(_HEX_VIEW_BYTES + 1024)
+            full_size = os.path.getsize(file_path)
+        except Exception as e:
+            messagebox.showerror("错误", f"读取文件失败：{e}")
+            return
+
+        hints = "；".join(detect_encoding_hints(data[:4096]))
+        header = (f"文件：{os.path.basename(file_path)} · {full_size:,} 字节\n"
+                  f"编码体检：{hints}\n"
+                  + (f"（仅显示前 {_HEX_VIEW_BYTES:,} 字节）\n" if full_size > _HEX_VIEW_BYTES else "")
+                  + "─" * 60 + "\n")
+        dump = hex_dump(data[:_HEX_VIEW_BYTES])
+
+        win = tk.Toplevel(self.root)
+        win.title(f"十六进制查看 - {os.path.basename(file_path)}")
+        win.geometry("860x560")
+        win.configure(bg=COLOR_CARD)
+        win.transient(self.root)
+
+        mono = ("Consolas", 10) if sys.platform.startswith("win") else ("Menlo", 10)
+        box = tk.Text(win, wrap=tk.NONE)
+        self._style_input_widget(box, font=mono)
+        box.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
+        box.insert("1.0", header + dump)
+        box.configure(state=tk.DISABLED)  # 只读
+
+        def copy_all():
+            self.root.clipboard_clear()
+            self.root.clipboard_append(header + dump)
+            self.status_var.set("十六进制转储已复制到剪贴板")
+
+        ttk.Button(win, text="复制全部", command=copy_all,
+                   style="Primary.TButton").pack(side=tk.BOTTOM, pady=(0, 8))
+
+    def compare_files(self):
+        """对比恰好两个选中文件的文本差异，生成彩色 HTML 报告并用浏览器打开"""
+        selected = self.file_listbox.curselection()
+        if len(selected) != 2:
+            messagebox.showinfo("提示", "请在文件列表中恰好选中两个文件（按住 Ctrl 多选）")
+            return
+        path_a, path_b = (self.file_list[i] for i in selected)
+        try:
+            text_a, _ = read_text_smart(path_a, self.encode_var.get())
+            text_b, _ = read_text_smart(path_b, self.encode_var.get())
+        except Exception as e:
+            messagebox.showerror("错误", f"读取文件失败：{e}")
+            return
+
+        name_a = os.path.basename(path_a)
+        name_b = os.path.basename(path_b)
+        report = unified_diff_html(name_a, name_b, text_a, text_b)
+        out = os.path.join(tempfile.gettempdir(),
+                           f"对比_{os.path.splitext(name_a)[0]}_vs_{os.path.splitext(name_b)[0]}.html")
+        try:
+            with open(out, "w", encoding="utf-8") as f:
+                f.write(report)
+            webbrowser.open("file:///" + out.replace("\\", "/"))
+            self.status_var.set(f"对比报告已生成：{out}")
+        except Exception as e:
+            messagebox.showerror("错误", f"生成对比报告失败：{e}")
+
     # ------------------------------ 文本处理核心方法 ------------------------------
     def process_selected_files(self, process_func):
         """批量处理选中的文件（未选中时询问是否处理全部），后台线程执行，仅修改内存"""
@@ -2851,7 +3023,7 @@ class TextProcessorApp:
 
 # ------------------------------ 命令行模式 ------------------------------
 # 不启动界面，便于脚本化批量处理；不带参数运行仍是图形界面
-_CLI_COMMANDS = {"split", "epub", "dedup", "sort", "adfilter", "convert", "stats"}
+_CLI_COMMANDS = {"split", "epub", "dedup", "sort", "adfilter", "convert", "stats", "hex", "diff"}
 
 
 def _cli_inplace_write(path, content, encode):
@@ -3029,6 +3201,36 @@ def _cli_cmd_stats(args):
     return 0
 
 
+def _cli_cmd_hex(args):
+    with open(args.file, "rb") as f:
+        data = f.read(args.bytes)
+    full_size = os.path.getsize(args.file)
+    print(f"文件：{args.file} · {full_size:,} 字节")
+    print(f"编码体检：{'；'.join(detect_encoding_hints(data))}")
+    if full_size > args.bytes:
+        print(f"（仅显示前 {args.bytes:,} 字节）")
+    print(hex_dump(data))
+    return 0
+
+
+def _cli_cmd_diff(args):
+    text_a, _ = read_text_smart(args.file_a, args.encoding)
+    text_b, _ = read_text_smart(args.file_b, args.encoding)
+    if args.out:
+        report = unified_diff_html(os.path.basename(args.file_a),
+                                   os.path.basename(args.file_b), text_a, text_b)
+        with open(args.out, "w", encoding="utf-8") as f:
+            f.write(report)
+        print(f"已生成对比报告：{args.out}")
+        return 0
+    diff_lines = difflib.unified_diff(
+        text_a.splitlines(), text_b.splitlines(),
+        fromfile=args.file_a, tofile=args.file_b, lineterm="")
+    for line in diff_lines:
+        print(line)
+    return 0
+
+
 def build_cli_parser():
     parser = argparse.ArgumentParser(
         prog="全能TXT文本处理器",
@@ -3092,6 +3294,18 @@ def build_cli_parser():
     p.add_argument("--pattern", default=None, help="自定义章节标题正则（优先于 --preset）")
     p.add_argument("--encoding", default="utf-8")
     p.set_defaults(func=_cli_cmd_stats)
+
+    p = sub.add_parser("hex", help="十六进制查看文件开头字节 + 编码体检（排查乱码）")
+    p.add_argument("file")
+    p.add_argument("--bytes", type=int, default=4096, help="显示前多少字节（默认 4096）")
+    p.set_defaults(func=_cli_cmd_hex)
+
+    p = sub.add_parser("diff", help="对比两个文件的文本差异（默认 stdout，--out 生成 HTML 报告）")
+    p.add_argument("file_a")
+    p.add_argument("file_b")
+    p.add_argument("--out", default=None, help="输出彩色 HTML 对比报告路径")
+    p.add_argument("--encoding", default="utf-8")
+    p.set_defaults(func=_cli_cmd_diff)
 
     return parser
 

@@ -370,6 +370,34 @@ class TestCli(unittest.TestCase):
             html_text = open(out, encoding="utf-8").read()
             self.assertIn("<svg", html_text)
 
+    def test_cli_hex_and_diff(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            pa = os.path.join(d, "a.txt")
+            pb = os.path.join(d, "b.txt")
+            with open(pa, "w", encoding="utf-8") as f:
+                f.write("第一版内容\n第二章保持不变\n")
+            with open(pb, "w", encoding="utf-8") as f:
+                f.write("第二版内容\n第二章保持不变\n新增结尾\n")
+            # GBK 编码文件应提示"不是合法 UTF-8"
+            gbk_path = os.path.join(d, "gbk.txt")
+            with open(gbk_path, "w", encoding="gbk") as f:
+                f.write("老编码文件")
+            r = self._run("hex", gbk_path)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertIn("不是合法 UTF-8", r.stdout)
+            self.assertIn("C0 CF", r.stdout)  # "老"字 GBK 编码为 C0 CF
+
+            r2 = self._run("diff", pa, pb)
+            self.assertEqual(r2.returncode, 0, r2.stderr)
+            self.assertIn("+新增结尾", r2.stdout)
+            self.assertIn("-第一版内容", r2.stdout)
+
+            out = os.path.join(d, "diff.html")
+            r3 = self._run("diff", pa, pb, "--out", out)
+            self.assertEqual(r3.returncode, 0, r3.stderr)
+            self.assertIn('class="line add"', open(out, encoding="utf-8").read())
+
 
 class TestStats(unittest.TestCase):
     SAMPLE = ('第一章 起\n主角说："这是正文内容。"\n\n第二章 承\n江湖风波再起。\n'
@@ -419,6 +447,41 @@ class TestStats(unittest.TestCase):
         self.assertIn("书名&lt;测试&gt;", report)   # 标题已转义
         self.assertIn("高频汉字", report)
         self.assertIn("数据未离开本机", report)
+
+
+class TestHexAndDiff(unittest.TestCase):
+    def test_hex_dump(self):
+        out = processor.hex_dump(b"ABC\x00\xff")
+        self.assertIn("00000000", out)
+        self.assertIn("41 42 43 00 FF", out)
+        self.assertIn("ABC", out)
+        self.assertIn("··", out)  # 不可见字符
+        # 多行偏移量递增
+        out2 = processor.hex_dump(bytes(range(40)))
+        self.assertIn("00000010", out2)
+        self.assertIn("00000020", out2)
+
+    def test_detect_encoding_hints(self):
+        self.assertIn("带 UTF-8 BOM", processor.detect_encoding_hints(b"\xef\xbb\xbfabc"))
+        self.assertIn("带 UTF-16 BOM", processor.detect_encoding_hints(b"\xff\xfe\x00a"))
+        self.assertIn("是合法 UTF-8", processor.detect_encoding_hints("中文".encode("utf-8")))
+        gbk_only = "中文".encode("gbk")
+        hints = processor.detect_encoding_hints(gbk_only)
+        self.assertIn("不是合法 UTF-8", "；".join(hints))
+        self.assertIn("可按 GBK 解码", "；".join(hints))
+
+    def test_unified_diff_html(self):
+        report = processor.unified_diff_html("旧.txt", "新.txt", "第一行\n第二行\n第三行",
+                                             "第一行\n第二行改\n第三行\n新增行")
+        self.assertIn('class="line del"', report)
+        self.assertIn('class="line add"', report)
+        self.assertIn("第二行改", report)
+        self.assertIn("+2 行 / -1 行", report)
+        self.assertIn("旧.txt vs 新.txt", report)
+
+    def test_unified_diff_html_identical(self):
+        report = processor.unified_diff_html("a", "b", "相同\n内容", "相同\n内容")
+        self.assertIn("内容完全一致", report)
 
 
 if __name__ == "__main__":
