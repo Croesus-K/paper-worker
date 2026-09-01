@@ -37,17 +37,26 @@
  18. 新增排版整理：压缩连续空行、清理行首尾空白
  19. 保存新增换行符选项（默认/LF/CRLF）；.bak 备份改为按字节复制，原样保留原始换行
 
+2.4 新增：
+ 20. 新增 TXT→EPUB 导出：按章节规则自动分章，打包为 EPUB3 电子书（纯标准库实现，零依赖）
+ 21. 新增 章节重排：按标题编号（中文/阿拉伯数字）升序整理乱序章节，开头内容保持最前
+ 22. 查找替换新增"标记全部"：预览区一次性高亮所有匹配项
+
 所有处理仅修改内存，需手动"保存到原文件"或"另存为新文件"才会写盘。
 运行依赖：tkinterdnd2（可选，pip install tkinterdnd2，用于拖放）
 """
 
 import difflib
+import html
 import json
 import os
 import queue
 import re
 import sys
 import threading
+import time
+import uuid
+import zipfile
 import tkinter as tk
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
@@ -58,7 +67,7 @@ except ImportError:
     DND_AVAILABLE = False
 
 # 默认窗口标题
-DEFAULT_TITLE = "全能TXT文本处理器 2.3"
+DEFAULT_TITLE = "全能TXT文本处理器 2.4"
 
 # ------------------------------ 界面主题配色（扁平化浅色主题） ------------------------------
 COLOR_BG        = "#EEF1F5"   # 页面背景
@@ -193,6 +202,171 @@ def compress_blank_lines(text):
 def strip_line_edges(text):
     """清理每行首尾的空白（半角/全角空格、制表符）"""
     return "\n".join(line.strip(" \t　") for line in text.split("\n"))
+
+
+# ------------------------------ 章节排序 ------------------------------
+_CN_DIGITS = {"零": 0, "一": 1, "二": 2, "三": 3, "四": 4, "五": 5,
+              "六": 6, "七": 7, "八": 8, "九": 9}
+_CN_UNITS = {"十": 10, "百": 100, "千": 1000, "万": 10000}
+
+
+def chinese_num_to_int(s):
+    """中文数字（含'两'）或阿拉伯数字 -> int；解析失败返回 None"""
+    s = (s or "").strip()
+    if not s:
+        return None
+    if s.isdigit():
+        return int(s)
+    total, section, num = 0, 0, 0   # total=万位以上累计, section=万以内累计, num=当前位
+    for ch in s:
+        if ch in _CN_DIGITS:
+            num = _CN_DIGITS[ch]
+        elif ch == "两":
+            num = 2
+        elif ch in _CN_UNITS:
+            unit = _CN_UNITS[ch]
+            if unit == 10000:
+                section = (section + num) * unit if (section + num) else unit
+                total += section
+                section, num = 0, 0
+            else:
+                section += (num or 1) * unit
+                num = 0
+        else:
+            return None
+    return total + section + num
+
+
+def chapter_sort_key(title):
+    """章节标题 -> 排序键：开头内容最前，有编号的按编号，无编号的（番外等）排最后"""
+    if title is None:
+        return (0, 0, "")
+    m = re.search(r"第([零一二三四五六七八九十百千万两\d]+)[章卷回节集篇]", title)
+    if m:
+        n = chinese_num_to_int(m.group(1))
+        if n is not None:
+            return (1, n, title)
+    # 仅当标题以数字开头（如 "12 xxx"）才按数字排序，避免"番外1"被当成第1章
+    m = re.match(r"\d+", title.strip())
+    if m:
+        return (1, int(m.group()), title)
+    return (2, 0, title)
+
+
+def sort_chapter_blocks(blocks):
+    """按章节编号升序稳定重排（开头内容保持在最前）"""
+    return sorted(blocks, key=lambda tb: chapter_sort_key(tb[0]))
+
+
+# ------------------------------ EPUB 导出 ------------------------------
+def text_to_xhtml_paragraphs(text):
+    """纯文本 -> XHTML 段落（每个非空行一个 <p>，内容做 HTML 转义）"""
+    lines = [line.strip() for line in
+             text.replace("\r\n", "\n").replace("\r", "\n").split("\n")]
+    return "".join(f"<p>{html.escape(line)}</p>" for line in lines if line)
+
+
+def chapter_xhtml(title, body):
+    """单个章节的 XHTML 页面"""
+    return (
+        '<?xml version="1.0" encoding="utf-8"?>\n'
+        "<!DOCTYPE html>\n"
+        '<html xmlns="http://www.w3.org/1999/xhtml" xml:lang="zh">\n<head>\n'
+        f"<title>{html.escape(title)}</title>\n"
+        '<link rel="stylesheet" type="text/css" href="style.css"/>\n'
+        "</head>\n<body>\n"
+        f"<h2>{html.escape(title)}</h2>\n"
+        + text_to_xhtml_paragraphs(body)
+        + "\n</body>\n</html>"
+    )
+
+
+_EPUB_CSS = (
+    "body { margin: 5% 8%; font-family: serif; line-height: 1.8; }\n"
+    "h2 { text-align: center; margin: 1.5em 0; font-size: 1.2em; }\n"
+    "p { text-indent: 2em; margin: 0.3em 0; }\n"
+)
+
+
+def build_epub(epub_path, book_title, chapters):
+    """把章节列表打包为 EPUB3 电子书。chapters: [(标题, 正文纯文本)]。零依赖。"""
+    book_uuid = uuid.uuid4()
+    modified = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+    container_xml = (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">\n'
+        "  <rootfiles>\n"
+        '    <rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/>\n'
+        "  </rootfiles>\n"
+        "</container>"
+    )
+
+    manifest_items, spine_items, nav_lis, ncx_points = [], [], [], []
+    for i, (title, _body) in enumerate(chapters, 1):
+        fname = f"chapter_{i:03d}.xhtml"
+        esc_title = html.escape(title)
+        manifest_items.append(
+            f'<item id="ch{i}" href="{fname}" media-type="application/xhtml+xml"/>')
+        spine_items.append(f'<itemref idref="ch{i}"/>')
+        nav_lis.append(f"<li><a href=\"{fname}\">{esc_title}</a></li>")
+        ncx_points.append(
+            f'<navPoint id="np{i}" playOrder="{i}"><navLabel><text>{esc_title}</text></navLabel>'
+            f'<content src="{fname}"/></navPoint>')
+
+    content_opf = (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="bookid">\n'
+        '  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">\n'
+        f"    <dc:identifier id=\"bookid\">urn:uuid:{book_uuid}</dc:identifier>\n"
+        f"    <dc:title>{html.escape(book_title)}</dc:title>\n"
+        "    <dc:language>zh</dc:language>\n"
+        f"    <meta property=\"dcterms:modified\">{modified}</meta>\n"
+        "  </metadata>\n"
+        "  <manifest>\n"
+        '    <item id="nav" href="nav.xhtml" media-type="application/xhtml+xml" properties="nav"/>\n'
+        '    <item id="ncx" href="toc.ncx" media-type="application/x-dtbncx+xml"/>\n'
+        '    <item id="css" href="style.css" media-type="text/css"/>\n'
+        "    " + "\n    ".join(manifest_items) + "\n"
+        "  </manifest>\n"
+        '  <spine toc="ncx">\n'
+        "    " + "\n    ".join(spine_items) + "\n"
+        "  </spine>\n"
+        "</package>"
+    )
+
+    nav_xhtml = (
+        '<?xml version="1.0" encoding="utf-8"?>\n'
+        "<!DOCTYPE html>\n"
+        '<html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops" xml:lang="zh">\n'
+        "<head><title>目录</title></head>\n"
+        '<body><nav epub:type="toc" id="toc"><h1>目录</h1><ol>\n'
+        + "\n".join(nav_lis)
+        + "\n</ol></nav></body>\n</html>"
+    )
+
+    toc_ncx = (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<ncx xmlns="http://www.daisy.org/z3986/2005/ncx/" version="2005-1">\n'
+        "<head>\n"
+        f"  <meta name=\"dtb:uid\" content=\"urn:uuid:{book_uuid}\"/>\n"
+        '  <meta name="dtb:depth" content="1"/>\n'
+        "</head>\n"
+        "<docTitle><text>" + html.escape(book_title) + "</text></docTitle>\n"
+        '<navMap>\n' + "\n".join(ncx_points) + "\n</navMap>\n</ncx>"
+    )
+
+    with zipfile.ZipFile(epub_path, "w") as z:
+        # mimetype 必须是首个条目且不压缩（EPUB 规范）
+        z.writestr(zipfile.ZipInfo("mimetype"), "application/epub+zip")
+        z.writestr("META-INF/container.xml", container_xml, zipfile.ZIP_DEFLATED)
+        z.writestr("OEBPS/content.opf", content_opf, zipfile.ZIP_DEFLATED)
+        z.writestr("OEBPS/style.css", _EPUB_CSS, zipfile.ZIP_DEFLATED)
+        z.writestr("OEBPS/nav.xhtml", nav_xhtml, zipfile.ZIP_DEFLATED)
+        z.writestr("OEBPS/toc.ncx", toc_ncx, zipfile.ZIP_DEFLATED)
+        for i, (title, body) in enumerate(chapters, 1):
+            z.writestr(f"OEBPS/chapter_{i:03d}.xhtml",
+                       chapter_xhtml(title, body), zipfile.ZIP_DEFLATED)
 
 
 class TextProcessorApp:
@@ -507,7 +681,7 @@ class TextProcessorApp:
         header_inner.pack(fill=tk.X, padx=14, pady=8)
         tk.Label(header_inner, text="全能TXT文本处理器", bg=COLOR_PRIMARY, fg="#FFFFFF",
                  font=(face, 15, "bold")).pack(side=tk.LEFT)
-        tk.Label(header_inner, text="v2.3 · 仅修改内存 · 手动保存", bg=COLOR_PRIMARY,
+        tk.Label(header_inner, text="v2.4 · 仅修改内存 · 手动保存", bg=COLOR_PRIMARY,
                  fg="#BFDBFE", font=(face, 9)).pack(side=tk.LEFT, padx=(10, 0), pady=(4, 0))
         self.busy_label = tk.Label(header_inner, text="", bg=COLOR_PRIMARY, fg="#FDE68A",
                                    font=(face, 10, "bold"))
@@ -600,10 +774,14 @@ class TextProcessorApp:
         file_tools_group.pack(side=tk.BOTTOM, fill=tk.X)
 
         tools_btn_frame = ttk.Frame(file_tools_group)
-        tools_btn_frame.pack(fill=tk.X, pady=6)
+        tools_btn_frame.pack(fill=tk.X, pady=(6, 2))
         self._action_button(tools_btn_frame, "合并文件", self.merge_files)
         self._action_button(tools_btn_frame, "分割章节", self.split_chapters)
         self._action_button(tools_btn_frame, "批量命名", self.batch_rename)
+
+        tools_btn_frame2 = ttk.Frame(file_tools_group)
+        tools_btn_frame2.pack(fill=tk.X, pady=(2, 6))
+        self._action_button(tools_btn_frame2, "导出EPUB", self.export_epub)
 
         # 文件列表（吃剩余空间，小窗口时缩列表而不是裁按钮）
         self.list_group = ttk.LabelFrame(left_frame, text="已加载文件列表（0）",
@@ -677,6 +855,7 @@ class TextProcessorApp:
             ("小说", [
                 ("过滤广告行", self.process_filter_ad_lines),
                 ("章节去重", self.process_dedup_chapters),
+                ("章节重排", self.process_sort_chapters),
                 ("压缩连续空行", lambda: self.process_selected_files(compress_blank_lines)),
                 ("清理行首尾空白", lambda: self.process_selected_files(strip_line_edges)),
             ]),
@@ -786,6 +965,7 @@ class TextProcessorApp:
         ttk.Button(button_frame, text="查找下一个", command=self.find_next, style="Primary.TButton").pack(side=tk.LEFT, padx=3)
         ttk.Button(button_frame, text="替换", command=self.replace_current).pack(side=tk.LEFT, padx=3)
         ttk.Button(button_frame, text="全部替换", command=self.replace_all_in_preview).pack(side=tk.LEFT, padx=3)
+        ttk.Button(button_frame, text="标记全部", command=self.mark_all_matches).pack(side=tk.LEFT, padx=3)
         self._action_button(button_frame, "批量替换所有文件", self.batch_replace_files).pack_configure(padx=(12, 3))
         ttk.Button(button_frame, text="从文件加载", command=self.load_text_from_file).pack(side=tk.LEFT, padx=3)
         ttk.Button(button_frame, text="载入编辑区内容", command=self.load_from_editor).pack(side=tk.LEFT, padx=3)
@@ -1394,6 +1574,46 @@ class TextProcessorApp:
         self.refresh_file_listbox()
         self.status_var.set(f"已批量重命名 {renamed} 个文件")
 
+    def export_epub(self):
+        """把选中（或全部）文件按章节规则分章后导出为 EPUB3 电子书（后台线程执行）"""
+        if self._busy_guard():
+            return
+        target_files = self._select_target_files("导出EPUB")
+        if not target_files:
+            return
+        save_dir = filedialog.askdirectory(title="选择 EPUB 保存目录")
+        if not save_dir:
+            return
+
+        def worker():
+            q = self.task_queue
+            exported = 0
+            step = 100 / len(target_files)
+            for idx, file_path in enumerate(target_files):
+                try:
+                    content = self.file_contents.get(file_path, "")
+                    stem = os.path.splitext(os.path.basename(file_path))[0]
+                    pattern = re.compile(_CHAPTER_PRESETS["第X章+序章/楔子/番外"])
+                    blocks = split_chapters_by_pattern(content, pattern)
+                    # 开头内容作为"前言"章节；跳过空章节
+                    chapters = [("前言", b) if t is None else (t, b)
+                                for t, b in blocks if b.strip()]
+                    if not chapters:
+                        q.put(("error", f"{os.path.basename(file_path)}：内容为空，已跳过"))
+                        continue
+                    epub_path = os.path.join(save_dir, f"{stem}.epub")
+                    build_epub(epub_path, stem, chapters)
+                    exported += 1
+                except Exception as e:
+                    q.put(("error", f"{os.path.basename(file_path)}：{str(e)}"))
+                q.put(("progress", (idx + 1) * step))
+
+            q.put(("progress", 0))
+            q.put(("status", f"EPUB 导出完成 | 成功 {exported}/{len(target_files)} 本"))
+            q.put(("done_msg", f"已导出 {exported} 本 EPUB\n保存于：{save_dir}"))
+
+        self._start_task(worker)
+
     # ------------------------------ 文本处理核心方法 ------------------------------
     def process_selected_files(self, process_func):
         """批量处理选中的文件（未选中时询问是否处理全部），后台线程执行，仅修改内存"""
@@ -1769,6 +1989,45 @@ class TextProcessorApp:
 
         self._start_task(worker)
 
+    def process_sort_chapters(self):
+        """章节重排：按标题编号（中文/阿拉伯数字）升序整理乱序章节（后台线程执行）"""
+        if self._busy_guard():
+            return
+        target_files = self._select_target_files("排序")
+        if not target_files:
+            return
+        pattern = re.compile(_CHAPTER_PRESETS["第X章+序章/楔子/番外"])
+
+        def worker():
+            q = self.task_queue
+            sorted_files = 0
+            step = 100 / len(target_files)
+            for idx, file_path in enumerate(target_files):
+                try:
+                    content = self.file_contents.get(file_path, "")
+                    blocks = split_chapters_by_pattern(content, pattern)
+                    if sum(1 for t, _ in blocks if t is not None) < 2:
+                        q.put(("error", f"{os.path.basename(file_path)}：未识别到章节（或仅一章），已跳过"))
+                        continue
+                    ordered = sort_chapter_blocks(blocks)
+                    if ordered != blocks:
+                        rebuilt = "\n\n".join(
+                            f"{t}\n\n{b.strip()}" if t is not None else b.strip()
+                            for t, b in ordered if b.strip())
+                        self.file_contents[file_path] = rebuilt
+                        sorted_files += 1
+                except Exception as e:
+                    q.put(("error", f"{os.path.basename(file_path)}：{str(e)}"))
+                q.put(("progress", (idx + 1) * step))
+
+            q.put(("progress", 0))
+            q.put(("status", f"章节重排完成 | {sorted_files}/{len(target_files)} 个文件有调整"
+                             f"（仅修改内存，需手动保存）"))
+            q.put(("done_msg", f"{sorted_files}/{len(target_files)} 个文件的章节顺序有调整"
+                               f"\n（编号解析失败的章节排在最后）"))
+
+        self._start_task(worker)
+
     # ------------------------------ 内容提取 ------------------------------
     def extract_emails(self):
         """提取邮箱地址"""
@@ -2083,6 +2342,34 @@ class TextProcessorApp:
         self.preview_text.tag_remove("search", "1.0", tk.END)
         self.last_find_pos = 0
         self.status_var.set(f"已替换 {count} 处匹配")
+
+    def mark_all_matches(self):
+        """在预览区一次性高亮所有匹配项（上限 5000 处，防止超大文本卡界面）"""
+        compiled = self._build_find_pattern()
+        if compiled is None:
+            messagebox.showinfo("提示", "请输入要查找的内容")
+            return
+
+        text = self.preview_text.get("1.0", "end-1c")
+        if not text:
+            return
+
+        self.preview_text.tag_remove("mark_all", "1.0", tk.END)
+        count = 0
+        for m in compiled.finditer(text):
+            if m.end() == m.start():
+                continue  # 跳过零宽匹配
+            if count >= 5000:
+                break
+            start_idx = self._offset_to_index(text, m.start())
+            end_idx = self._offset_to_index(text, m.end())
+            self.preview_text.tag_add("mark_all", start_idx, end_idx)
+            count += 1
+        self.preview_text.tag_config("mark_all", background="#FDE68A")
+        if count >= 5000:
+            self.status_var.set(f"已标记 5000 处匹配（达到上限，后续匹配未标记）")
+        else:
+            self.status_var.set(f"已标记 {count} 处匹配")
 
     def batch_replace_files(self):
         """批量替换选中（或全部）文件缓存中的匹配项（后台线程执行，仅修改内存）"""

@@ -148,5 +148,76 @@ class TestBlankLines(unittest.TestCase):
         self.assertEqual(processor.strip_line_edges("  x　\n\ty \n z"), "x\ny\nz")
 
 
+class TestChineseNum(unittest.TestCase):
+    def test_digits(self):
+        for s, n in [("一", 1), ("十", 10), ("二十三", 23), ("一百零三", 103),
+                     ("两千零六", 2006), ("一万二千", 12000), ("三万零一十", 30010),
+                     ("108", 108), ("两", 2), ("两章", None), ("", None), ("abc", None)]:
+            self.assertEqual(processor.chinese_num_to_int(s), n, s)
+
+
+class TestChapterSort(unittest.TestCase):
+    def test_key_order(self):
+        key = processor.chapter_sort_key
+        self.assertLess(key(None), key("第一章 x"))
+        self.assertLess(key("第九章 x"), key("第十章 x"))
+        self.assertLess(key("第十章 x"), key("第十一章 x"))
+        self.assertLess(key("第十一章 x"), key("第一百零一章 x"))
+        self.assertLess(key("第2章"), key("第10章"))
+        self.assertLess(key("第九章"), key("Chapter 10"))   # 有编号 > 无编号
+        self.assertLess(key("第10章"), key("番外"))          # 无编号排最后
+
+    def test_sort_blocks(self):
+        blocks = [("第一章 甲", "a"), (None, "前言"), ("第十二章 转折", "b"),
+                  ("第二章 乙", "c"), ("番外1", "d")]
+        ordered = processor.sort_chapter_blocks(blocks)
+        titles = [t for t, _ in ordered]
+        self.assertEqual(titles, [None, "第一章 甲", "第二章 乙", "第十二章 转折", "番外1"])
+
+
+class TestEpub(unittest.TestCase):
+    def test_paragraph_escape(self):
+        out = processor.text_to_xhtml_paragraphs('第一行<边>\n\n第二行 & "引号"\n第三行')
+        self.assertEqual(out.count("<p>"), 3)
+        self.assertIn("&lt;边&gt;", out)
+        self.assertIn("&amp;", out)
+        self.assertNotIn("<边>", out)
+
+    def test_build_epub_structure(self):
+        import tempfile, zipfile
+        chapters = [("前言", "开场白"), ("第一章 起点", "主角登场\n内容<测试>"),
+                    ("第二章 转折", "发展")]
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "测试书.epub")
+            processor.build_epub(path, "测试书", chapters)
+            with zipfile.ZipFile(path) as z:
+                names = z.namelist()
+                # mimetype 必须是第一个条目且未压缩
+                self.assertEqual(names[0], "mimetype")
+                self.assertEqual(z.getinfo("mimetype").compress_type, zipfile.ZIP_STORED)
+                self.assertEqual(z.read("mimetype"), b"application/epub+zip")
+                for required in ("META-INF/container.xml", "OEBPS/content.opf",
+                                 "OEBPS/nav.xhtml", "OEBPS/toc.ncx", "OEBPS/style.css",
+                                 "OEBPS/chapter_001.xhtml", "OEBPS/chapter_002.xhtml",
+                                 "OEBPS/chapter_003.xhtml"):
+                    self.assertIn(required, names)
+                ch2 = z.read("OEBPS/chapter_002.xhtml").decode("utf-8")
+                self.assertIn("<h2>第一章 起点</h2>", ch2)
+                self.assertIn("<p>内容&lt;测试&gt;</p>", ch2)
+                opf = z.read("OEBPS/content.opf").decode("utf-8")
+                self.assertIn("<dc:title>测试书</dc:title>", opf)
+                self.assertIn('href="chapter_003.xhtml"', opf)
+                nav = z.read("OEBPS/nav.xhtml").decode("utf-8")
+                self.assertIn("第二章 转折", nav)
+
+    def test_sort_and_export_pipeline(self):
+        # 模拟"章节重排 -> EPUB 导出"的完整数据流
+        text = "第一章 甲\n内容A\n第十二章 转折\n内容B\n第二章 乙\n内容C"
+        pattern = re.compile(processor._CHAPTER_PRESETS["第X章+序章/楔子/番外"])
+        blocks = processor.sort_chapter_blocks(processor.split_chapters_by_pattern(text, pattern))
+        chapters = [("前言", b) if t is None else (t, b) for t, b in blocks if b.strip()]
+        self.assertEqual([t for t, _ in chapters], ["第一章 甲", "第二章 乙", "第十二章 转折"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
