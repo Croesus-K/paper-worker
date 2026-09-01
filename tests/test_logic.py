@@ -499,10 +499,12 @@ class TestEngineering(unittest.TestCase):
             self.assertEqual(src_enc2, "utf-8-sig")
             with open(dst2, "rb") as f:
                 self.assertFalse(f.read().startswith(b"\xef\xbb\xbf"))
-            # 非法字节 -> 替换并提示
+            # UTF-16 BOM 源 + 截断的半个码元 -> 替换并提示
+            # （BOM 探测与系统 ANSI 代码页无关，保证在任意 locale 的机器上结果一致）
             src3 = os.path.join(d, "bad.txt")
             with open(src3, "wb") as f:
-                f.write("中文".encode("gbk") + b"\xff\xfe\xff")
+                f.write("中文".encode("utf-16"))
+                f.write(b"\x00")
             dst3 = os.path.join(d, "out3.txt")
             _, replaced3 = processor.convert_file_stream(src3, dst3, "utf-8")
             self.assertTrue(replaced3)
