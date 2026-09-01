@@ -63,11 +63,18 @@
  29. 新增 比较文件：选中恰好两个文件生成彩色 HTML 差异报告（红删绿增）并用浏览器打开；
      CLI 提供 diff 子命令（--out 生成 HTML）
 
+2.8 新增（工程补强）：
+ 30. 批量操作可撤销：每次批量修改前自动快照（上限 5 步），「撤销上一步」一键恢复内存内容
+ 31. 大文件流式转码：CLI convert 对超过 8MB 的文件走增量解码/编码，内存占用与文件大小无关
+ 32. 检查更新：标题栏按钮联网对比 GitHub latest release，发现新版可直达发布页；CLI version --check
+ 33. CI 加固：发布前强制跑单元测试（测试不过不发版），新增 push/PR 触发的 ci.yml
+
 所有处理仅修改内存，需手动"保存到原文件"或"另存为新文件"才会写盘。
 运行依赖：tkinterdnd2（可选，pip install tkinterdnd2，用于拖放）
 """
 
 import argparse
+import codecs
 import difflib
 import html
 import json
@@ -79,6 +86,8 @@ import sys
 import tempfile
 import threading
 import time
+import urllib.error
+import urllib.request
 import uuid
 import webbrowser
 import zipfile
@@ -93,7 +102,8 @@ except ImportError:
     DND_AVAILABLE = False
 
 # 默认窗口标题
-DEFAULT_TITLE = "全能TXT文本处理器 2.7"
+_APP_VERSION = "2.8"
+DEFAULT_TITLE = f"全能TXT文本处理器 {_APP_VERSION}"
 
 # ------------------------------ 界面主题配色（扁平化浅色主题） ------------------------------
 COLOR_BG        = "#EEF1F5"   # 页面背景
@@ -777,6 +787,85 @@ def unified_diff_html(title_a, title_b, a_text, b_text, context=3):
 </html>"""
 
 
+# ------------------------------ 工程补强：撤销 / 更新检查 / 流式转码 ------------------------------
+_UNDO_LIMIT = 5                    # 撤销栈上限（步）
+_STREAM_THRESHOLD = 8 * 1024 * 1024  # 超过该字节数的文件转码走流式（8MB）
+
+
+def push_undo_snapshot(stack, label, contents, keys, limit=_UNDO_LIMIT):
+    """把 keys 指定文件的当前内容快照压入撤销栈（超出上限丢弃最旧的）。
+    返回是否成功入栈。"""
+    snapshot = {k: contents[k] for k in keys if k in contents}
+    if not snapshot:
+        return False
+    stack.append({"label": label, "snapshot": snapshot})
+    while len(stack) > limit:
+        stack.pop(0)
+    return True
+
+
+def version_tuple(tag):
+    """"v2.10" -> (2, 10)，用于版本号大小比较"""
+    return tuple(int(x) for x in re.findall(r"\d+", str(tag))[:3]) or (0,)
+
+
+_UPDATE_API = "https://api.github.com/repos/Croesus-K/paper-worker/releases/latest"
+
+
+def check_update_from_github(timeout=8):
+    """查询 GitHub latest release。返回 (tag_name, html_url)；网络失败抛异常。"""
+    request = urllib.request.Request(
+        _UPDATE_API,
+        headers={"Accept": "application/vnd.github+json", "User-Agent": "paper-worker"})
+    with urllib.request.urlopen(request, timeout=timeout) as resp:
+        data = json.load(resp)
+    return data.get("tag_name", ""), data.get("html_url", "")
+
+
+def _detect_source_encoding(path):
+    """从文件头（最多 1MB）探测源编码：BOM 优先，其次 UTF-8 合法性、GBK 兜底"""
+    with open(path, "rb") as f:
+        head = f.read(1024 * 1024)
+    if head.startswith(codecs.BOM_UTF8):
+        return "utf-8-sig"
+    if head.startswith(codecs.BOM_UTF16_LE) or head.startswith(codecs.BOM_UTF16_BE):
+        return "utf-16"
+    try:
+        head.decode("utf-8")
+        return "utf-8"
+    except UnicodeDecodeError:
+        pass
+    try:
+        head.decode("gbk")
+        return "gbk"
+    except UnicodeDecodeError:
+        return system_ansi()
+
+
+def convert_file_stream(src, dst, target_encoding, chunk_size=1024 * 1024):
+    """流式转码大文件：先探测源编码，再增量解码/编码写入，内存占用与文件大小无关。
+    返回 (源编码, 是否出现无法解码字节)。探测仅基于头部 1MB，中段混入其他编码的
+    字节会以 U+FFFD 替换并在返回值中提示。"""
+    src_enc = _detect_source_encoding(src)
+    replaced = False
+    decoder = codecs.getincrementaldecoder(src_enc)(errors="replace")
+    encoder = codecs.getincrementalencoder(target_encoding)()
+    with open(src, "rb") as fin, open(dst, "wb") as fout:
+        while True:
+            chunk = fin.read(chunk_size)
+            if not chunk:
+                break
+            text = decoder.decode(chunk)
+            if "\ufffd" in text:
+                replaced = True
+            fout.write(encoder.encode(text))
+        tail = decoder.decode(b"", True)  # 冲刷多字节残留（可疑尾字节在此阶段才产出）
+        if "\ufffd" in tail:
+            replaced = True
+        fout.write(encoder.encode(tail))
+    return src_enc, replaced
+
+
 class TextProcessorApp:
     def __init__(self, root):
         self.root = root
@@ -805,6 +894,7 @@ class TextProcessorApp:
         self.ad_whole_line = False     # 广告过滤：整行完全匹配才删除
         self.epub_author = ""          # EPUB 导出作者名（持久化）
         self.newline_var = tk.StringVar(value="默认")  # 保存时的换行符模式
+        self._undo_stack = []          # 批量操作撤销栈（仅内存内容，不影响磁盘）
 
         # 界面控件注册
         self.task_buttons = []         # 任务执行期间需要禁用的按钮
@@ -829,6 +919,29 @@ class TextProcessorApp:
 
         # 关闭窗口时保存设置
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    def _push_undo(self, label, target_files):
+        """批量修改前调用：快照受影响文件的内存内容（主线程调用）"""
+        return push_undo_snapshot(self._undo_stack, label, self.file_contents, target_files)
+
+    def undo_last_batch(self):
+        """撤销上一次批量操作（恢复内存内容，不改动磁盘文件）"""
+        if self._busy_guard():
+            return
+        if not self._undo_stack:
+            messagebox.showinfo("提示", "没有可撤销的批量操作")
+            return
+        entry = self._undo_stack[-1]
+        n = len(entry["snapshot"])
+        if not messagebox.askyesno(
+                "确认撤销",
+                f"撤销「{entry['label']}」？\n将恢复 {n} 个文件的内存内容（磁盘文件不受影响）。"):
+            return
+        self._undo_stack.pop()
+        self.file_contents.update(entry["snapshot"])
+        self.show_selected_file_content()
+        left = f"（还可撤销 {len(self._undo_stack)} 步）" if self._undo_stack else "（已到最早一步）"
+        self.status_var.set(f"已撤销「{entry['label']}」{left}")
 
     # ------------------------------ 环境适配 ------------------------------
     def enable_high_dpi(self):
@@ -1063,8 +1176,13 @@ class TextProcessorApp:
         header_inner.pack(fill=tk.X, padx=14, pady=8)
         tk.Label(header_inner, text="全能TXT文本处理器", bg=COLOR_PRIMARY, fg="#FFFFFF",
                  font=(face, 15, "bold")).pack(side=tk.LEFT)
-        tk.Label(header_inner, text="v2.7 · 仅修改内存 · 手动保存", bg=COLOR_PRIMARY,
+        tk.Label(header_inner, text="v2.8 · 仅修改内存 · 手动保存", bg=COLOR_PRIMARY,
                  fg="#BFDBFE", font=(face, 9)).pack(side=tk.LEFT, padx=(10, 0), pady=(4, 0))
+        # 检查更新（标题栏右侧扁平小按钮）
+        tk.Button(header_inner, text="检查更新", command=self.check_update,
+                  bg=COLOR_PRIMARY, fg="#FFFFFF", relief="flat", bd=0,
+                  activebackground=COLOR_PRIMARY_D, activeforeground="#FFFFFF",
+                  font=(face, 9), cursor="hand2").pack(side=tk.RIGHT, padx=(0, 12))
         self.busy_label = tk.Label(header_inner, text="", bg=COLOR_PRIMARY, fg="#FDE68A",
                                    font=(face, 10, "bold"))
         self.busy_label.pack(side=tk.RIGHT)
@@ -1107,6 +1225,34 @@ class TextProcessorApp:
         """Ctrl+F：跳到查找替换标签页并聚焦查找框"""
         self.tab_control.select(1)
         self.find_entry.focus_set()
+
+    def check_update(self):
+        """联网检查 GitHub latest release（后台线程，结果回主线程弹窗）"""
+        self.status_var.set("正在检查更新…")
+
+        def worker():
+            try:
+                tag, url = check_update_from_github()
+                self.root.after(0, lambda: self._show_update_result(tag, url))
+            except Exception as e:
+                self.root.after(0, lambda: self._show_update_result(None, str(e)))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _show_update_result(self, tag, extra):
+        """展示检查更新结果（主线程）"""
+        if tag is None:
+            self.status_var.set("检查更新失败")
+            messagebox.showwarning("检查更新", f"无法连接 GitHub：{extra}\n请检查网络或代理设置。")
+            return
+        if version_tuple(tag) > version_tuple(_APP_VERSION):
+            self.status_var.set(f"发现新版本 {tag}")
+            if messagebox.askyesno("发现新版本",
+                                   f"最新版本：{tag}\n当前版本：{_APP_VERSION}\n\n是否打开发布页下载？"):
+                webbrowser.open(extra)
+        else:
+            self.status_var.set(f"已是最新版本（{_APP_VERSION}）")
+            messagebox.showinfo("检查更新", f"已是最新版本（{_APP_VERSION}）")
 
     def build_process_tab(self, parent):
         """构建文件处理标签页"""
@@ -1223,31 +1369,34 @@ class TextProcessorApp:
                                        style="Card.TLabelframe")
 
         process_rows = [
+            ("历史", [
+                ("撤销上一步", self.undo_last_batch),
+            ]),
             ("排版", [
-                ("合并非标点后换行", lambda: self.process_selected_files(self.merge_unwanted_newlines)),
-                ("句号后强制换行", lambda: self.process_selected_files(self.force_newline_after_period)),
-                ("段首缩进", lambda: self.process_selected_files(self.add_paragraph_indent)),
-                ("去除段首缩进", lambda: self.process_selected_files(self.remove_paragraph_indent)),
+                ("合并非标点后换行", lambda: self.process_selected_files(self.merge_unwanted_newlines, "合并非标点后换行")),
+                ("句号后强制换行", lambda: self.process_selected_files(self.force_newline_after_period, "句号后强制换行")),
+                ("段首缩进", lambda: self.process_selected_files(self.add_paragraph_indent, "段首缩进")),
+                ("去除段首缩进", lambda: self.process_selected_files(self.remove_paragraph_indent, "去除段首缩进")),
             ]),
             ("清理", [
-                ("去除空行", lambda: self.process_selected_files(self.remove_empty_lines)),
-                ("去除所有空格", lambda: self.process_selected_files(self.remove_all_spaces)),
-                ("去除重复行", lambda: self.process_selected_files(self.remove_duplicate_lines)),
-                ("去除日期信息", lambda: self.process_selected_files(self.remove_date_info)),
-                ("去除HTML标签", lambda: self.process_selected_files(self.strip_html_tags)),
+                ("去除空行", lambda: self.process_selected_files(self.remove_empty_lines, "去除空行")),
+                ("去除所有空格", lambda: self.process_selected_files(self.remove_all_spaces, "去除所有空格")),
+                ("去除重复行", lambda: self.process_selected_files(self.remove_duplicate_lines, "去除重复行")),
+                ("去除日期信息", lambda: self.process_selected_files(self.remove_date_info, "去除日期信息")),
+                ("去除HTML标签", lambda: self.process_selected_files(self.strip_html_tags, "去除HTML标签")),
             ]),
             ("小说", [
                 ("过滤广告行", self.process_filter_ad_lines),
                 ("章节去重", self.process_dedup_chapters),
                 ("章节重排", self.process_sort_chapters),
-                ("压缩连续空行", lambda: self.process_selected_files(compress_blank_lines)),
-                ("清理行首尾空白", lambda: self.process_selected_files(strip_line_edges)),
+                ("压缩连续空行", lambda: self.process_selected_files(compress_blank_lines, "压缩连续空行")),
+                ("清理行首尾空白", lambda: self.process_selected_files(strip_line_edges, "清理行首尾空白")),
             ]),
             ("转换", [
-                ("转大写", lambda: self.process_selected_files(self.to_uppercase)),
-                ("转小写", lambda: self.process_selected_files(self.to_lowercase)),
-                ("全角转半角", lambda: self.process_selected_files(self.fullwidth_to_halfwidth)),
-                ("中文标点统一", lambda: self.process_selected_files(self.unify_cjk_punctuation)),
+                ("转大写", lambda: self.process_selected_files(self.to_uppercase, "转大写")),
+                ("转小写", lambda: self.process_selected_files(self.to_lowercase, "转小写")),
+                ("全角转半角", lambda: self.process_selected_files(self.fullwidth_to_halfwidth, "全角转半角")),
+                ("中文标点统一", lambda: self.process_selected_files(self.unify_cjk_punctuation, "中文标点统一")),
                 ("添加前缀", self.process_add_prefix),
                 ("添加后缀", self.process_add_suffix),
             ]),
@@ -1505,6 +1654,10 @@ class TextProcessorApp:
             messagebox.showerror("错误", "部分操作失败：\n" + "\n".join(self._task_errors[:5]))
         else:
             messagebox.showinfo(self._task_done_title, self._task_done_msg)
+        if self._undo_stack:
+            last = self._undo_stack[-1]
+            self.status_var.set(self.status_var.get()
+                                + f" | 可撤销：{last['label']} 等 {len(self._undo_stack)} 步")
 
     # ------------------------------ 编辑同步 ------------------------------
     def _on_editor_modified(self, event=None):
@@ -2145,8 +2298,9 @@ class TextProcessorApp:
             messagebox.showerror("错误", f"生成对比报告失败：{e}")
 
     # ------------------------------ 文本处理核心方法 ------------------------------
-    def process_selected_files(self, process_func):
-        """批量处理选中的文件（未选中时询问是否处理全部），后台线程执行，仅修改内存"""
+    def process_selected_files(self, process_func, label="批量文本处理"):
+        """批量处理选中的文件（未选中时询问是否处理全部），后台线程执行，仅修改内存。
+        修改前自动快照，可通过「撤销上一步」恢复。"""
         if self._busy_guard():
             return
         selected_indices = self.file_listbox.curselection()
@@ -2164,6 +2318,7 @@ class TextProcessorApp:
             messagebox.showinfo("提示", "没有文件可处理")
             return
 
+        self._push_undo(label, target_files)
         def worker():
             q = self.task_queue
             step = 100 / len(target_files)
@@ -2189,7 +2344,7 @@ class TextProcessorApp:
         if prefix is None:
             return
         self.process_selected_files(
-            lambda t: "\n".join(prefix + line for line in t.splitlines()))
+            lambda t: "\n".join(prefix + line for line in t.splitlines()), "添加前缀")
 
     def process_add_suffix(self):
         """为每一行添加后缀"""
@@ -2197,7 +2352,7 @@ class TextProcessorApp:
         if suffix is None:
             return
         self.process_selected_files(
-            lambda t: "\n".join(line + suffix for line in t.splitlines()))
+            lambda t: "\n".join(line + suffix for line in t.splitlines()), "添加后缀")
 
     def remove_empty_lines(self, text):
         """去除空行（保留有效内容行）"""
@@ -2450,6 +2605,8 @@ class TextProcessorApp:
 
     def _run_filter_ad_lines(self, target_files, keywords, whole_line):
         """后台执行广告行过滤，统计各文件删除行数"""
+        self._push_undo("过滤广告行", target_files)
+
         def worker():
             q = self.task_queue
             total_removed = 0
@@ -2481,6 +2638,7 @@ class TextProcessorApp:
         target_files = self._select_target_files("去重")
         if not target_files:
             return
+        self._push_undo("章节去重", target_files)
         pattern = re.compile(_CHAPTER_PRESETS["第X章+序章/楔子/番外"])
 
         def worker():
@@ -2523,6 +2681,7 @@ class TextProcessorApp:
         target_files = self._select_target_files("排序")
         if not target_files:
             return
+        self._push_undo("章节重排", target_files)
         pattern = re.compile(_CHAPTER_PRESETS["第X章+序章/楔子/番外"])
 
         def worker():
@@ -2960,6 +3119,7 @@ class TextProcessorApp:
             target_files = self.file_list.copy()
 
         replacement = self._get_replacement()
+        self._push_undo("批量替换", target_files)
 
         def worker():
             q = self.task_queue
@@ -3023,7 +3183,8 @@ class TextProcessorApp:
 
 # ------------------------------ 命令行模式 ------------------------------
 # 不启动界面，便于脚本化批量处理；不带参数运行仍是图形界面
-_CLI_COMMANDS = {"split", "epub", "dedup", "sort", "adfilter", "convert", "stats", "hex", "diff"}
+_CLI_COMMANDS = {"split", "epub", "dedup", "sort", "adfilter", "convert",
+                 "stats", "hex", "diff", "version"}
 
 
 def _cli_inplace_write(path, content, encode):
@@ -3168,8 +3329,27 @@ def _cli_cmd_adfilter(args):
 
 def _cli_cmd_convert(args):
     for path in args.files:
-        content, src_enc = read_text_smart(path, "utf-8")  # 源编码智能探测
+        size = os.path.getsize(path)
         target = display_to_codec(args.to)
+        if size > _STREAM_THRESHOLD:
+            # 大文件流式转码，内存占用恒定
+            src_enc = _detect_source_encoding(path)
+            if args.in_place:
+                if not os.path.exists(path + ".bak"):
+                    with open(path, "rb") as src, open(path + ".bak", "wb") as dst:
+                        dst.write(src.read())
+                tmp = path + ".converting"
+                src_enc, replaced = convert_file_stream(path, tmp, target)
+                os.replace(tmp, path)
+            else:
+                outdir = args.outdir or "."
+                os.makedirs(outdir, exist_ok=True)
+                out_path = os.path.join(outdir, os.path.basename(path))
+                src_enc, replaced = convert_file_stream(path, out_path, target)
+            note = "（含无法解码字节，已用 U+FFFD 替换）" if replaced else ""
+            print(f"[完成] {path}：流式转码 {src_enc} -> {args.to}{note}")
+            continue
+        content, src_enc = read_text_smart(path, "utf-8")  # 源编码智能探测
         if args.in_place:
             _cli_inplace_write(path, content, target)
         else:
@@ -3179,6 +3359,21 @@ def _cli_cmd_convert(args):
             with open(out_path, "w", encoding=target, newline="") as f:
                 f.write(content)
         print(f"[完成] {path}：{src_enc} -> {args.to}")
+    return 0
+
+
+def _cli_cmd_version(args):
+    print(f"全能TXT文本处理器 {_APP_VERSION}")
+    if args.check:
+        try:
+            tag, url = check_update_from_github()
+        except Exception as e:
+            print(f"检查更新失败：{e}", file=sys.stderr)
+            return 1
+        if version_tuple(tag) > version_tuple(_APP_VERSION):
+            print(f"发现新版本：{tag}\n{url}")
+        else:
+            print("已是最新版本")
     return 0
 
 
@@ -3306,6 +3501,10 @@ def build_cli_parser():
     p.add_argument("--out", default=None, help="输出彩色 HTML 对比报告路径")
     p.add_argument("--encoding", default="utf-8")
     p.set_defaults(func=_cli_cmd_diff)
+
+    p = sub.add_parser("version", help="显示版本号（--check 联网检查更新）")
+    p.add_argument("--check", action="store_true", help="联网查询 GitHub 最新 Release")
+    p.set_defaults(func=_cli_cmd_version)
 
     return parser
 

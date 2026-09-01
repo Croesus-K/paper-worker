@@ -52,6 +52,8 @@
 
 ### 体验细节
 - 批量操作在**后台线程**执行，大文件、多文件不卡界面
+- **批量操作可撤销**：每次批量修改前自动快照（上限 5 步），「撤销上一步」一键恢复内存内容
+- **检查更新**：标题栏按钮联网对比 GitHub 最新 Release，发现新版可直达发布页
 - 字数统计、状态栏实时显示文件编码与大小
 - 快捷键：`Ctrl+S` 保存到原文件，`Ctrl+Shift+S` 另存为，`Ctrl+F` 跳到查找页
 - 记住编码选择与窗口大小（`processor_settings.json`）
@@ -117,6 +119,13 @@ python 全能TXT文本处理器.py hex 疑似乱码.txt --bytes 2048
 
 # 文件对比：stdout 输出 unified diff，--out 生成彩色 HTML 报告
 python 全能TXT文本处理器.py diff 旧版.txt 新版.txt --out 对比.html
+
+# 查看版本 / 联网检查更新
+python 全能TXT文本处理器.py version
+python 全能TXT文本处理器.py version --check
+
+# 大文件（>8MB）转码自动走流式，内存占用与文件大小无关
+python 全能TXT文本处理器.py convert 超大日志.txt --to utf-8 --outdir 转码后/
 
 # 全部子命令支持 --pattern 自定义章节正则、--encoding 指定读取编码
 python 全能TXT文本处理器.py --help

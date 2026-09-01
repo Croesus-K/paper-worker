@@ -20,6 +20,10 @@ jobs:
         with:
           python-version: "3.13"
 
+      # 测试门禁：测试不通过则中止发布
+      - name: Run tests
+        run: python tests/test_logic.py
+
       - name: Install dependencies
         run: pip install pyinstaller tkinterdnd2
 

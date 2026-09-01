@@ -1,0 +1,20 @@
+name: CI
+
+# 每次推送到 main 或开 PR 都跑一遍单元测试，防止坏代码合入
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Run tests
+        run: python tests/test_logic.py

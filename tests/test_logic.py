@@ -398,6 +398,11 @@ class TestCli(unittest.TestCase):
             self.assertEqual(r3.returncode, 0, r3.stderr)
             self.assertIn('class="line add"', open(out, encoding="utf-8").read())
 
+    def test_cli_version(self):
+        r = self._run("version")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn(processor._APP_VERSION, r.stdout)
+
 
 class TestStats(unittest.TestCase):
     SAMPLE = ('第一章 起\n主角说："这是正文内容。"\n\n第二章 承\n江湖风波再起。\n'
@@ -447,6 +452,60 @@ class TestStats(unittest.TestCase):
         self.assertIn("书名&lt;测试&gt;", report)   # 标题已转义
         self.assertIn("高频汉字", report)
         self.assertIn("数据未离开本机", report)
+
+
+class TestEngineering(unittest.TestCase):
+    def test_version_tuple(self):
+        vt = processor.version_tuple
+        self.assertEqual(vt("v2.8"), (2, 8))
+        self.assertLess(vt("v2.9"), vt("v2.10"))
+        self.assertLess(vt("v2.8"), vt("v3.0"))
+        self.assertEqual(vt("garbage"), (0,))
+
+    def test_push_undo_snapshot(self):
+        stack = []
+        contents = {"a.txt": "内容A", "b.txt": "内容B"}
+        self.assertTrue(processor.push_undo_snapshot(stack, "去除空行", contents, ["a.txt"]))
+        self.assertEqual(len(stack), 1)
+        self.assertEqual(stack[0]["snapshot"], {"a.txt": "内容A"})
+        # 不在 contents 中的 key 被跳过；全部缺失时不入栈
+        self.assertFalse(processor.push_undo_snapshot(stack, "x", contents, ["c.txt"]))
+        # 上限裁剪，最旧的先被丢弃
+        for i in range(processor._UNDO_LIMIT + 2):
+            processor.push_undo_snapshot(stack, f"第{i}步", contents, ["a.txt"])
+        self.assertEqual(len(stack), processor._UNDO_LIMIT)
+        self.assertEqual(stack[0]["label"], "第2步")
+
+    def test_convert_file_stream(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            # GBK 源 -> UTF-8 目标
+            src = os.path.join(d, "gbk.txt")
+            with open(src, "w", encoding="gbk") as f:
+                f.write("第一章 起点正常。\n" * 500 + "结尾：完。")
+            dst = os.path.join(d, "out.txt")
+            src_enc, replaced = processor.convert_file_stream(src, dst, "utf-8")
+            self.assertEqual(src_enc, "gbk")
+            self.assertFalse(replaced)
+            text = open(dst, encoding="utf-8").read()
+            self.assertTrue(text.startswith("第一章 起点正常。"))
+            self.assertTrue(text.endswith("结尾：完。"))
+            # UTF-8 BOM 源 -> BOM 被去除
+            src2 = os.path.join(d, "bom.txt")
+            with open(src2, "w", encoding="utf-8-sig") as f:
+                f.write("带BOM内容")
+            dst2 = os.path.join(d, "out2.txt")
+            src_enc2, _ = processor.convert_file_stream(src2, dst2, "utf-8")
+            self.assertEqual(src_enc2, "utf-8-sig")
+            with open(dst2, "rb") as f:
+                self.assertFalse(f.read().startswith(b"\xef\xbb\xbf"))
+            # 非法字节 -> 替换并提示
+            src3 = os.path.join(d, "bad.txt")
+            with open(src3, "wb") as f:
+                f.write("中文".encode("gbk") + b"\xff\xfe\xff")
+            dst3 = os.path.join(d, "out3.txt")
+            _, replaced3 = processor.convert_file_stream(src3, dst3, "utf-8")
+            self.assertTrue(replaced3)
 
 
 class TestHexAndDiff(unittest.TestCase):
