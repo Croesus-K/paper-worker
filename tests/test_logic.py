@@ -403,6 +403,29 @@ class TestCli(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn(processor._APP_VERSION, r.stdout)
 
+    def test_cli_docx_epub2txt(self):
+        import tempfile, zipfile
+        with tempfile.TemporaryDirectory() as d:
+            novel = os.path.join(d, "小说.txt")
+            with open(novel, "w", encoding="utf-8") as f:
+                f.write("第一章 起点\n主角登场。\n\n第二章 相遇\n故人重逢。\n")
+            docx_out = os.path.join(d, "小说.docx")
+            r = self._run("docx", novel, "--out", docx_out, "--author", "作者乙")
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertTrue(os.path.exists(docx_out))
+            with zipfile.ZipFile(docx_out) as z:
+                self.assertIn("故人重逢。", z.read("word/document.xml").decode("utf-8"))
+
+            epub_out = os.path.join(d, "小说.epub")
+            r2 = self._run("epub", novel, "--out", epub_out)
+            self.assertEqual(r2.returncode, 0, r2.stderr)
+            txt_out = os.path.join(d, "还原.txt")
+            r3 = self._run("epub2txt", epub_out, "--out", txt_out)
+            self.assertEqual(r3.returncode, 0, r3.stderr)
+            restored = open(txt_out, encoding="utf-8").read()
+            self.assertIn("第一章 起点", restored)
+            self.assertIn("故人重逢。", restored)
+
 
 class TestStats(unittest.TestCase):
     SAMPLE = ('第一章 起\n主角说："这是正文内容。"\n\n第二章 承\n江湖风波再起。\n'
@@ -543,6 +566,76 @@ class TestHexAndDiff(unittest.TestCase):
     def test_unified_diff_html_identical(self):
         report = processor.unified_diff_html("a", "b", "相同\n内容", "相同\n内容")
         self.assertIn("内容完全一致", report)
+
+
+class TestAuthor(unittest.TestCase):
+    NOVEL = [("第一章 起点", "主角登场，主角看向前方。"), ("第二章 相遇", "故人重逢。"),
+             ("第三章 决意", "主角下定决心。")]
+
+    def test_build_docx_structure(self):
+        import tempfile, zipfile
+        import xml.etree.ElementTree as ET
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "书.docx")
+            processor.build_docx(path, "书名", self.NOVEL, author="作者甲")
+            with zipfile.ZipFile(path) as z:
+                names = z.namelist()
+                self.assertIn("[Content_Types].xml", names)
+                self.assertIn("_rels/.rels", names)
+                self.assertIn("word/document.xml", names)
+                doc = z.read("word/document.xml").decode("utf-8")
+                root = ET.fromstring(doc)  # XML 必须良构
+                text = "".join(root.itertext())
+                self.assertIn("书名", text)
+                self.assertIn("作者甲", text)
+                self.assertIn("主角登场，主角看向前方。", text)
+                self.assertIn("故人重逢。", text)
+
+    def test_epub_roundtrip(self):
+        import tempfile, zipfile
+        with tempfile.TemporaryDirectory() as d:
+            epub_path = os.path.join(d, "书.epub")
+            processor.build_epub(epub_path, "测试书", self.NOVEL, author="作者甲")
+            title, chapters = processor.extract_text_from_epub(epub_path)
+            self.assertEqual(title, "测试书")
+            self.assertEqual([t for t, _ in chapters], [t for t, _ in self.NOVEL])
+            self.assertIn("主角登场", chapters[0][1])
+            text = processor.chapters_to_txt(chapters)
+            self.assertIn("第一章 起点\n\n主角登场", text)
+            self.assertIn("\n\n第三章 决意", text)
+
+    def test_chapters_to_txt_skips_empty(self):
+        text = processor.chapters_to_txt([("第一章", "内容"), ("空章", ""), (None, "散落内容")])
+        self.assertNotIn("空章", text)
+        self.assertIn("散落内容", text)
+
+    def test_count_name_per_chapter(self):
+        blocks = [(None, "前言"), ("第一章", "甲出现甲出现"), ("第二章", "甲和乙都出现")]
+        series = processor.count_name_per_chapter(blocks, ["甲", "乙"])
+        self.assertEqual(series[0], ("甲", [0, 2, 1]))
+        self.assertEqual(series[1], ("乙", [0, 0, 1]))
+
+    def test_svg_line_chart(self):
+        svg = processor.svg_line_chart([("甲", [1, 3, 2]), ("乙", [0, 5, 1])])
+        self.assertEqual(svg.count("<polyline"), 2)
+        self.assertIn(">甲</text>", svg)   # 图例
+        self.assertIn("<title>甲 · 第2章：3</title>", svg)
+        self.assertEqual(processor.svg_line_chart([]), "")
+
+    def test_report_rhythm_and_names(self):
+        # 8 章、第 5 章明显偏短：应触发节奏提示
+        parts = [f"第{i}章 标题{i}\n" + "正文内容。" * (60 if i != 5 else 5) for i in range(1, 9)]
+        text = "\n\n".join(parts)
+        pattern = re.compile(processor._CHAPTER_PRESETS["第X章"])
+        report = processor.build_text_report(text, "节奏书", pattern, names=["正文"])
+        self.assertIn("章节节奏提示", report)
+        self.assertIn("中位章字数", report)
+        self.assertIn("异常短章", report)
+        self.assertIn("人物出场曲线", report)
+        self.assertIn("中位", report)  # 分布图中位虚线标签
+        # 人名全程未出现时不出曲线区块
+        report2 = processor.build_text_report(text, "书", pattern, names=["路人丙"])
+        self.assertNotIn("人物出场曲线", report2)
 
 
 if __name__ == "__main__":

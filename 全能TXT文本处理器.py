@@ -69,6 +69,15 @@
  32. 检查更新：标题栏按钮联网对比 GitHub latest release，发现新版可直达发布页；CLI version --check
  33. CI 加固：发布前强制跑单元测试（测试不过不发版），新增 push/PR 触发的 ci.yml
 
+2.9 新增（作者向）：
+ 34. 新增 Word 导出：按章节规则分章打包为 .docx（OOXML 最小结构，纯标准库零依赖），
+     书名/作者/章节标题分级排版，正文首行缩进；CLI docx 子命令
+ 35. 新增 EPUB→TXT 反向导入：解析 spine 顺序提取全文（CLI epub2txt 子命令），格式闭环
+ 36. 统计报告新增「章节节奏提示」：中位章字数基准线（分布图叠加黄色虚线）、
+     最长/最短章、异常短章（低于中位 40%）与连续短章段（水更/断更嫌疑）
+ 37. 统计报告新增「人物出场曲线」：按章节统计指定人名出现次数的多折线图（GUI 报告时询问人名，
+     CLI stats --names 甲,乙）
+
 所有处理仅修改内存，需手动"保存到原文件"或"另存为新文件"才会写盘。
 运行依赖：tkinterdnd2（可选，pip install tkinterdnd2，用于拖放）
 """
@@ -80,6 +89,7 @@ import html
 import json
 import math
 import os
+import posixpath
 import queue
 import re
 import sys
@@ -102,7 +112,7 @@ except ImportError:
     DND_AVAILABLE = False
 
 # 默认窗口标题
-_APP_VERSION = "2.8"
+_APP_VERSION = "2.9"
 DEFAULT_TITLE = f"全能TXT文本处理器 {_APP_VERSION}"
 
 # ------------------------------ 界面主题配色（扁平化浅色主题） ------------------------------
@@ -447,6 +457,124 @@ def build_epub(epub_path, book_title, chapters, author="", cover=None, cover_ext
                        chapter_xhtml(title, body), zipfile.ZIP_DEFLATED)
 
 
+# ------------------------------ DOCX 导出与 EPUB 导入 ------------------------------
+def _docx_para(text, bold=False, center=False, indent=False, size=None):
+    """单个 OOXML 段落。size 单位为半磅（w:sz），如 32 = 16pt。"""
+    props = []
+    if bold:
+        props.append("<w:b/>")
+    if size:
+        props.append(f'<w:sz w:val="{size}"/>')
+    rpr = f"<w:rPr>{''.join(props)}</w:rPr>" if props else ""
+    ppr_parts = []
+    if center:
+        ppr_parts.append('<w:jc w:val="center"/>')
+    if indent:
+        ppr_parts.append('<w:ind w:firstLine="480"/>')  # 首行缩进两个字符（24pt=480 缇）
+    ppr = f"<w:pPr>{''.join(ppr_parts)}</w:pPr>" if ppr_parts else ""
+    # XML 不允许的控制字符去除（保留制表符）
+    clean = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", "", text)
+    return (f"<w:p>{ppr}<w:r>{rpr}<w:t xml:space=\"preserve\">"
+            f"{html.escape(clean)}</w:t></w:r></w:p>")
+
+
+def build_docx(docx_path, book_title, chapters, author=""):
+    """把章节列表打包为 .docx（Word 2007+ OOXML）。chapters: [(标题, 正文纯文本)]。
+    仅用标准库 zipfile 手写最小结构，零依赖。"""
+    body_parts = [_docx_para(book_title, bold=True, center=True, size=44)]
+    if author:
+        body_parts.append(_docx_para(author, center=True, size=24))
+    for title, text in chapters:
+        body_parts.append(_docx_para(title, bold=True, size=30))
+        for line in text.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+            if line.strip():
+                body_parts.append(_docx_para(line.strip(), indent=True))
+    document_xml = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
+        '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+        "<w:body>" + "".join(body_parts) + "<w:sectPr/></w:body></w:document>"
+    )
+    content_types = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+        '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+        '<Default Extension="xml" ContentType="application/xml"/>'
+        '<Override PartName="/word/document.xml" '
+        'ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>'
+        "</Types>"
+    )
+    rels = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        '<Relationship Id="rId1" '
+        'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" '
+        'Target="word/document.xml"/>'
+        "</Relationships>"
+    )
+    with zipfile.ZipFile(docx_path, "w") as z:
+        z.writestr("[Content_Types].xml", content_types, zipfile.ZIP_DEFLATED)
+        z.writestr("_rels/.rels", rels, zipfile.ZIP_DEFLATED)
+        z.writestr("word/document.xml", document_xml, zipfile.ZIP_DEFLATED)
+
+
+def extract_text_from_epub(epub_path):
+    """解析 EPUB 电子书，提取书名与章节文本。返回 (书名, [(标题或None, 纯文本)])。
+    纯标准库实现，不依赖第三方解析器。"""
+    with zipfile.ZipFile(epub_path) as z:
+        container = z.read("META-INF/container.xml").decode("utf-8", errors="replace")
+        opf_m = re.search(r'full-path="([^"]+)"', container)
+        if not opf_m:
+            raise ValueError("container.xml 中未找到 OPF 路径")
+        opf_path = opf_m.group(1)
+        opf = z.read(opf_path).decode("utf-8", errors="replace")
+        title_m = re.search(r"<dc:title[^>]*>(.*?)</dc:title>", opf, re.S)
+        title = html.unescape(title_m.group(1)).strip() if title_m else \
+            os.path.splitext(os.path.basename(epub_path))[0]
+        # manifest：id -> href（属性顺序不定，逐标签分别提取）
+        items = {}
+        for tag in re.findall(r"<item\b[^>]*>", opf):
+            mid = re.search(r'\bid="([^"]+)"', tag)
+            mhref = re.search(r'\bhref="([^"]+)"', tag)
+            if mid and mhref:
+                items[mid.group(1)] = mhref.group(1)
+        opf_dir = posixpath.dirname(opf_path)
+        chapters = []
+        for idref in re.findall(r'<itemref\b[^>]*idref="([^"]+)"', opf):
+            href = items.get(idref)
+            if not href:
+                continue
+            full = posixpath.normpath(posixpath.join(opf_dir, href) if opf_dir else href)
+            if full not in z.namelist():
+                continue
+            xhtml = z.read(full).decode("utf-8", errors="replace")
+            body_m = re.search(r"<body[^>]*>(.*)</body>", xhtml, re.S | re.I)
+            body = body_m.group(1) if body_m else xhtml
+            head_m = re.search(r"<h[1-6][^>]*>(.*?)</h[1-6]>", body, re.S | re.I)
+            chap_title = None
+            if head_m:
+                chap_title = re.sub(r"<[^>]+>", "", head_m.group(1)).strip() or None
+                # 标题已单独提取，从正文里去掉，避免 chapters_to_txt 重复
+                body = body[:head_m.start()] + body[head_m.end():]
+            text = re.sub(r"<(script|style)\b[^>]*>.*?</\1>", "", body, flags=re.S | re.I)
+            text = html.unescape(re.sub(r"<[^>]+>", "\n", text))
+            lines = [line.strip() for line in text.splitlines()]
+            text = "\n".join(line for line in lines if line)
+            if text:
+                chapters.append((chap_title, text))
+        return title, chapters
+
+
+def chapters_to_txt(chapters):
+    """[(标题或None, 正文)] -> 单个 TXT 字符串（标题独立成行，章节间空行分隔）"""
+    parts = []
+    for title, text in chapters:
+        text = text.strip()
+        if not text:
+            continue
+        parts.append(f"{title}\n\n{text}" if title else text)
+    return "\n\n".join(parts) + ("\n" if parts else "")
+
+
 def system_ansi():
     """当前系统的 ANSI 编码名（Windows 为 mbcs）"""
     return "mbcs" if sys.platform.startswith("win") else "cp1252"
@@ -547,8 +675,8 @@ def bucket_series(items, max_bars=100):
     return out
 
 
-def svg_vbars(items, width=880, height=260, color="#2563EB"):
-    """纵向柱状图 SVG（矩形内嵌 <title> 提供原生悬停提示）"""
+def svg_vbars(items, width=880, height=260, color="#2563EB", median=None):
+    """纵向柱状图 SVG（矩形内嵌 <title> 提供原生悬停提示，可叠加中位虚线）"""
     if not items:
         return ""
     n = len(items)
@@ -572,8 +700,71 @@ def svg_vbars(items, width=880, height=260, color="#2563EB"):
                          f'text-anchor="middle" fill="#6B7280">{short}</text>')
     parts.append(f'<line x1="{pad_l}" y1="{pad_t + plot_h}" x2="{width - pad_l}" '
                  f'y2="{pad_t + plot_h}" stroke="#D9DEE7"/>')
+    if median:
+        y = pad_t + plot_h * (1 - min(1, median / vmax))
+        parts.append(f'<line x1="{pad_l}" y1="{y:.1f}" x2="{width - pad_l}" y2="{y:.1f}" '
+                     f'stroke="#F59E0B" stroke-dasharray="6 4"/>')
+        parts.append(f'<text x="{width - pad_l}" y="{y - 4:.1f}" font-size="10" text-anchor="end" '
+                     f'fill="#F59E0B">中位 {median:,.0f}</text>')
     parts.append("</svg>")
     return "".join(parts)
+
+
+_LINE_COLORS = ["#2563EB", "#DC2626", "#059669", "#D97706",
+                "#7C3AED", "#DB2777", "#0891B2", "#65A30D"]
+
+
+def svg_line_chart(series, width=880, height=300):
+    """多折线图 SVG。series: [(名称, [逐章数值...])]；自动绘制图例与横轴刻度。"""
+    series = [(name, list(vals)) for name, vals in series if vals]
+    if not series:
+        return ""
+    n = max(len(vals) for _, vals in series)
+    vmax = max((max(vals) for _, vals in series), default=0) or 1
+    pad_l, pad_b, top = 10, 24, 40  # top：图例区高度
+    plot_w, plot_h = width - pad_l * 2, height - pad_b - top
+    slot = plot_w / max(1, n - 1)
+    parts = [f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" '
+             f'viewBox="0 0 {width} {height}" role="img">']
+    # 图例
+    lx = pad_l
+    for idx, (name, _) in enumerate(series):
+        color = _LINE_COLORS[idx % len(_LINE_COLORS)]
+        parts.append(f'<rect x="{lx}" y="6" width="12" height="12" rx="2" fill="{color}"/>')
+        parts.append(f'<text x="{lx + 16}" y="16" font-size="12" fill="#1F2937">{html.escape(name)}</text>')
+        lx += 26 + len(name) * 13
+    # 折线与数据点（悬浮提示挂在数据点上）
+    for idx, (name, vals) in enumerate(series):
+        color = _LINE_COLORS[idx % len(_LINE_COLORS)]
+        pts = []
+        for i, v in enumerate(vals):
+            x = pad_l + i * slot
+            y = top + plot_h * (1 - v / vmax)
+            pts.append(f"{x:.1f},{y:.1f}")
+        parts.append(f'<polyline fill="none" stroke="{color}" stroke-width="2" '
+                     f'points="{" ".join(pts)}"/>')
+        for i, v in enumerate(vals):
+            x, y = pts[i].split(",")
+            parts.append(f'<circle cx="{x}" cy="{y}" r="2.5" fill="{color}">'
+                         f'<title>{html.escape(name)} · 第{i + 1}章：{v}</title></circle>')
+    # 横轴
+    axis_y = top + plot_h
+    parts.append(f'<line x1="{pad_l}" y1="{axis_y}" x2="{width - pad_l}" '
+                 f'y2="{axis_y}" stroke="#D9DEE7"/>')
+    step = max(1, math.ceil(n / 12))
+    for i in range(0, n, step):
+        x = pad_l + i * slot
+        parts.append(f'<text x="{x:.1f}" y="{height - 6}" font-size="10" '
+                     f'text-anchor="middle" fill="#6B7280">{i + 1}</text>')
+    parts.append("</svg>")
+    return "".join(parts)
+
+
+def count_name_per_chapter(chapter_blocks, names):
+    """统计人名在每章正文中的出现次数。
+    chapter_blocks: [(标题或None, 正文)]；返回 [(人名, [每章次数...])]"""
+    bodies = [b for _, b in chapter_blocks if b.strip()]
+    return [(name, [body.count(name) for body in bodies]) for name in names]
 
 
 def svg_hbars(items, width=880, color="#2563EB"):
@@ -629,14 +820,55 @@ footer { text-align: center; color: var(--muted); font-size: 12px; margin-top: 8
 """
 
 
-def build_text_report(text, book_title, pattern):
-    """生成完整 HTML 统计报告字符串（pattern 用于识别章节）"""
+def build_text_report(text, book_title, pattern, names=None):
+    """生成完整 HTML 统计报告字符串（pattern 用于识别章节；names 为可选追踪人名）"""
     stats = compute_text_stats(text)
     blocks = split_chapters_by_pattern(text, pattern)
     chapter_items = [(t, len(b.strip())) for t, b in blocks if t is not None]
     shown = bucket_series(chapter_items)
     unigrams = top_cjk_unigrams(text, 30)
     bigrams = top_cjk_bigrams(text, 15)
+
+    # 章节节奏：中位数与异常短章（不足 6 章时不做节奏判断）
+    median = None
+    rhythm_html = ""
+    if len(chapter_items) >= 6:
+        svals = sorted(v for _, v in chapter_items)
+        median = (svals[len(svals) // 2] + svals[(len(svals) - 1) // 2]) / 2
+        threshold = median * 0.4
+        shorts = [(t, v) for t, v in chapter_items if v < threshold]
+        runs, run = [], []
+        for idx, (_, v) in enumerate(chapter_items):
+            if v < threshold:
+                run.append(idx + 1)
+            elif len(run) >= 3:
+                runs.append(run)
+                run = []
+        if len(run) >= 3:
+            runs.append(run)
+        longest = max(chapter_items, key=lambda tv: tv[1])
+        shortest = min(chapter_items, key=lambda tv: tv[1])
+        run_text = "、".join(
+            f"第{r[0]}-{r[-1]}章（连续 {len(r)} 章）" if len(r) > 1 else f"第{r[0]}章"
+            for r in runs) or "无"
+        rhythm_rows = (
+            f"<tr><td>中位章字数</td><td>{median:,.0f}</td></tr>"
+            f"<tr><td>最长章</td><td>{html.escape(longest[0])}（{longest[1]:,} 字）</td></tr>"
+            f"<tr><td>最短章</td><td>{html.escape(shortest[0])}（{shortest[1]:,} 字）</td></tr>"
+            f"<tr><td>异常短章（低于中位 40%）</td><td>{len(shorts)} 章</td></tr>"
+            f"<tr><td>连续短章嫌疑（疑似水更/断更）</td><td>{html.escape(run_text)}</td></tr>")
+        rhythm_html = ('<section><h2>章节节奏提示</h2>'
+                       '<p class="desc">以中位章字数为基准检测异常波动，供节奏自查参考</p>'
+                       f"<table>{rhythm_rows}</table></section>")
+
+    # 人物出场曲线
+    names_html = ""
+    if names:
+        series = count_name_per_chapter(blocks, names)
+        if any(sum(vals) for _, vals in series):
+            names_html = ('<section><h2>人物出场曲线</h2>'
+                          '<p class="desc">按章节统计人名出现次数（悬停数据点查看详情）</p>'
+                          + svg_line_chart(series) + "</section>")
 
     def card(num, lab):
         return f'<div class="card"><div class="num">{num}</div><div class="lab">{lab}</div></div>'
@@ -661,7 +893,7 @@ def build_text_report(text, book_title, pattern):
            if len(chapter_items) > 100 else
            (f'<p class="desc">共 {len(chapter_items)} 章</p>' if chapter_items else
             '<p class="desc">未识别到章节标题</p>'))
-        + (svg_vbars(shown) if shown else "")
+        + (svg_vbars(shown, median=median) if shown else "")
         + "</section>")
 
     uni_svg = svg_hbars(unigrams)
@@ -681,6 +913,8 @@ def build_text_report(text, book_title, pattern):
   <div class="meta">生成于 {time.strftime("%Y-%m-%d %H:%M")} · 共 {stats['total_chars']:,} 字符</div>
   <div class="cards">{overview}</div>
   {chapter_section}
+  {names_html}
+  {rhythm_html}
   <section><h2>高频汉字 Top {len(unigrams)}</h2>
     <p class="desc">已剔除"的了是在"等虚词，反映用字偏好</p>
     {uni_svg}</section>
@@ -689,7 +923,7 @@ def build_text_report(text, book_title, pattern):
     <table><tr><th>组合</th><th>出现次数</th></tr>{bi_rows}</table></section>
   <section><h2>标点使用</h2>
     <table><tr><th>标点</th><th>次数</th></tr>{punct_rows}</table></section>
-  <footer>全能TXT文本处理器 2.6 本地生成 · 数据未离开本机</footer>
+  <footer>全能TXT文本处理器 {_APP_VERSION} 本地生成 · 数据未离开本机</footer>
 </div>
 </body>
 </html>"""
@@ -1176,7 +1410,7 @@ class TextProcessorApp:
         header_inner.pack(fill=tk.X, padx=14, pady=8)
         tk.Label(header_inner, text="全能TXT文本处理器", bg=COLOR_PRIMARY, fg="#FFFFFF",
                  font=(face, 15, "bold")).pack(side=tk.LEFT)
-        tk.Label(header_inner, text="v2.8 · 仅修改内存 · 手动保存", bg=COLOR_PRIMARY,
+        tk.Label(header_inner, text="v2.9 · 仅修改内存 · 手动保存", bg=COLOR_PRIMARY,
                  fg="#BFDBFE", font=(face, 9)).pack(side=tk.LEFT, padx=(10, 0), pady=(4, 0))
         # 检查更新（标题栏右侧扁平小按钮）
         tk.Button(header_inner, text="检查更新", command=self.check_update,
@@ -1308,10 +1542,14 @@ class TextProcessorApp:
         self._action_button(tools_btn_frame, "批量命名", self.batch_rename)
 
         tools_btn_frame2 = ttk.Frame(file_tools_group)
-        tools_btn_frame2.pack(fill=tk.X, pady=(2, 6))
+        tools_btn_frame2.pack(fill=tk.X, pady=(2, 2))
         self._action_button(tools_btn_frame2, "导出EPUB", self.export_epub)
-        self._action_button(tools_btn_frame2, "十六进制查看", self.show_hex_viewer)
-        self._action_button(tools_btn_frame2, "比较文件", self.compare_files)
+        self._action_button(tools_btn_frame2, "导出DOCX", self.export_docx)
+
+        tools_btn_frame3 = ttk.Frame(file_tools_group)
+        tools_btn_frame3.pack(fill=tk.X, pady=(2, 6))
+        self._action_button(tools_btn_frame3, "十六进制查看", self.show_hex_viewer)
+        self._action_button(tools_btn_frame3, "比较文件", self.compare_files)
 
         # 文件列表（吃剩余空间，小窗口时缩列表而不是裁按钮）
         self.list_group = ttk.LabelFrame(left_frame, text="已加载文件列表（0）",
@@ -2227,6 +2465,55 @@ class TextProcessorApp:
 
         self._start_task(worker)
 
+    def export_docx(self):
+        """把选中（或全部）文件按章节规则分章后导出为 Word 文档（后台线程执行）"""
+        if self._busy_guard():
+            return
+        target_files = self._select_target_files("导出DOCX")
+        if not target_files:
+            return
+        if len(target_files) == 1:
+            default_name = os.path.splitext(os.path.basename(target_files[0]))[0] + ".docx"
+            out_path = filedialog.asksaveasfilename(
+                title="保存 Word 文档", defaultextension=".docx", initialfile=default_name,
+                filetypes=[("Word 文档", "*.docx"), ("所有文件", "*.*")])
+            if not out_path:
+                return
+            jobs = [(fp, out_path) for fp in target_files]
+        else:
+            save_dir = filedialog.askdirectory(title="选择 Word 文档保存目录")
+            if not save_dir:
+                return
+            jobs = [(fp, os.path.join(save_dir, os.path.splitext(os.path.basename(fp))[0] + ".docx"))
+                    for fp in target_files]
+
+        def worker():
+            q = self.task_queue
+            exported = 0
+            step = 100 / len(jobs)
+            for idx, (file_path, out_path) in enumerate(jobs):
+                try:
+                    content = self.file_contents.get(file_path, "")
+                    stem = os.path.splitext(os.path.basename(file_path))[0]
+                    pattern = re.compile(_CHAPTER_PRESETS["第X章+序章/楔子/番外"])
+                    blocks = split_chapters_by_pattern(content, pattern)
+                    chapters = [("前言", b) if t is None else (t, b)
+                                for t, b in blocks if b.strip()]
+                    if not chapters:
+                        q.put(("error", f"{os.path.basename(file_path)}：内容为空，已跳过"))
+                        continue
+                    build_docx(out_path, stem, chapters)
+                    exported += 1
+                except Exception as e:
+                    q.put(("error", f"{os.path.basename(file_path)}：{str(e)}"))
+                q.put(("progress", (idx + 1) * step))
+
+            q.put(("progress", 0))
+            q.put(("status", f"DOCX 导出完成 | 成功 {exported}/{len(jobs)} 个"))
+            q.put(("done_msg", f"已导出 {exported} 个 Word 文档"))
+
+        self._start_task(worker)
+
     def show_hex_viewer(self):
         """以十六进制查看选中文件的开头字节，附编码体检提示（排查乱码根源）"""
         selected = self.file_listbox.curselection()
@@ -2834,6 +3121,9 @@ class TextProcessorApp:
             filetypes=[("HTML 报告", "*.html"), ("所有文件", "*.*")])
         if not out_path:
             return
+        names_raw = simpledialog.askstring(
+            "人物追踪", "输入要统计出场次数的人名（逗号分隔，留空跳过）：", parent=self.root)
+        names = [n.strip() for n in (names_raw or "").replace("，", ",").split(",") if n.strip()]
         pattern = re.compile(_CHAPTER_PRESETS["第X章+序章/楔子/番外"])
 
         def worker():
@@ -2845,7 +3135,7 @@ class TextProcessorApp:
                 try:
                     content = self.file_contents.get(file_path, "")
                     stem = os.path.splitext(os.path.basename(file_path))[0]
-                    report = build_text_report(content, stem, pattern)
+                    report = build_text_report(content, stem, pattern, names=names)
                     if len(target_files) == 1:
                         out = out_path
                     else:
@@ -3183,8 +3473,8 @@ class TextProcessorApp:
 
 # ------------------------------ 命令行模式 ------------------------------
 # 不启动界面，便于脚本化批量处理；不带参数运行仍是图形界面
-_CLI_COMMANDS = {"split", "epub", "dedup", "sort", "adfilter", "convert",
-                 "stats", "hex", "diff", "version"}
+_CLI_COMMANDS = {"split", "epub", "docx", "epub2txt", "dedup", "sort",
+                 "adfilter", "convert", "stats", "hex", "diff", "version"}
 
 
 def _cli_inplace_write(path, content, encode):
@@ -3426,6 +3716,31 @@ def _cli_cmd_diff(args):
     return 0
 
 
+def _cli_cmd_docx(args):
+    content, _ = read_text_smart(args.file, args.encoding)
+    stem = os.path.splitext(os.path.basename(args.file))[0]
+    blocks = _cli_split_content(content, args.preset, args.pattern)
+    chapters = [("前言", b) if t is None else (t, b) for t, b in blocks if b.strip()]
+    if not chapters:
+        print("错误：内容为空", file=sys.stderr)
+        return 1
+    build_docx(args.out, args.title or stem, chapters, author=args.author)
+    print(f"已导出 DOCX：{args.out}（{len(chapters)} 章）")
+    return 0
+
+
+def _cli_cmd_epub2txt(args):
+    title, chapters = extract_text_from_epub(args.file)
+    text = chapters_to_txt(chapters)
+    if not text.strip():
+        print("错误：未从 EPUB 中提取到文本", file=sys.stderr)
+        return 1
+    with open(args.out, "w", encoding="utf-8") as f:
+        f.write(text)
+    print(f"已导入 EPUB：《{title}》共 {len(chapters)} 章 -> {args.out}")
+    return 0
+
+
 def build_cli_parser():
     parser = argparse.ArgumentParser(
         prog="全能TXT文本处理器",
@@ -3505,6 +3820,22 @@ def build_cli_parser():
     p = sub.add_parser("version", help="显示版本号（--check 联网检查更新）")
     p.add_argument("--check", action="store_true", help="联网查询 GitHub 最新 Release")
     p.set_defaults(func=_cli_cmd_version)
+
+    p = sub.add_parser("docx", help="导出 Word 文档（.docx）")
+    p.add_argument("file", help="TXT 文件")
+    p.add_argument("--out", required=True, help="输出的 .docx 路径")
+    p.add_argument("--title", default=None, help="书名（默认用文件名）")
+    p.add_argument("--author", default="", help="作者名")
+    p.add_argument("--preset", default="第X章+序章/楔子/番外",
+                   choices=list(_CHAPTER_PRESETS), help="内置章节规则")
+    p.add_argument("--pattern", default=None, help="自定义章节标题正则（优先于 --preset）")
+    p.add_argument("--encoding", default="utf-8")
+    p.set_defaults(func=_cli_cmd_docx)
+
+    p = sub.add_parser("epub2txt", help="EPUB 电子书反向导入为 TXT")
+    p.add_argument("file", help=".epub 文件")
+    p.add_argument("--out", required=True, help="输出的 .txt 路径（UTF-8）")
+    p.set_defaults(func=_cli_cmd_epub2txt)
 
     return parser
 
