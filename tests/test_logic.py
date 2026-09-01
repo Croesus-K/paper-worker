@@ -1,10 +1,16 @@
 # -*- coding: utf-8 -*-
 """纯逻辑单元测试（不启动 GUI）：python tests/test_logic.py"""
 import importlib.util
+import io
+import json
 import os
 import re
 import sys
 import unittest
+import urllib.error
+import urllib.parse
+import urllib.request
+import zipfile
 
 SPEC = importlib.util.spec_from_file_location(
     "processor",
@@ -691,6 +697,112 @@ class TestSensitive(unittest.TestCase):
         self.assertIn("【词A】2 处 —— 第 3、17 行", report)
         self.assertIn("未命中：词B", report)
         self.assertIn("合计：2 处命中", report)
+
+
+class TestWeb(unittest.TestCase):
+    """Web 工作台 API 端到端测试（真实起服务器，仅监听 127.0.0.1 随机端口）"""
+
+    def setUp(self):
+        import threading
+        wb = processor.WebWorkbench(port=0, open_browser=False)
+        self.server = wb.make_server()
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        self.base = f"http://127.0.0.1:{self.server.server_address[1]}"
+        # 绕过环境代理，直连本机
+        self.opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        self.addCleanup(self.server.shutdown)
+
+    def _get(self, path):
+        try:
+            return self.opener.open(self.base + path, timeout=10)
+        except urllib.error.HTTPError as e:
+            return e  # 4xx/5xx 响应对象，仍可读 status 与 body
+
+    def _post_json(self, path, obj):
+        req = urllib.request.Request(
+            self.base + path, data=json.dumps(obj).encode("utf-8"),
+            headers={"Content-Type": "application/json"})
+        try:
+            return self.opener.open(req, timeout=10)
+        except urllib.error.HTTPError as e:
+            return e
+
+    def _post_raw(self, path, data, headers):
+        req = urllib.request.Request(self.base + path, data=data, headers=headers)
+        try:
+            return self.opener.open(req, timeout=10)
+        except urllib.error.HTTPError as e:
+            return e
+
+    def test_page_and_ops(self):
+        page = self._get("/").read().decode("utf-8")
+        self.assertIn("Web 工作台", page)
+        ops = json.loads(self._get("/api/ops").read().decode("utf-8"))["ops"]
+        self.assertIn("去除空行", ops)
+        self.assertIn("压缩连续空行", ops)
+
+    def test_full_flow(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            src = os.path.join(d, "小说.txt")
+            with open(src, "w", encoding="utf-8") as f:
+                f.write("第一章 A\n内容一行。\n\n\n\n压缩我。\n")
+            # 本地打开
+            r = self._post_json("/api/open_local", {"path": src})
+            self.assertEqual(json.loads(r.read().decode()), {"name": "小说.txt", "encoding": "utf-8"})
+            state = json.loads(self._get("/api/state").read().decode())
+            self.assertEqual(state["files"][0]["name"], "小说.txt")
+            self.assertEqual(state["files"][0]["path"], src)
+            # 内容
+            content = json.loads(self._get(
+                "/api/content?name=" + urllib.parse.quote("小说.txt")).read().decode())
+            self.assertIn("第一章 A", content["text"])
+            # 处理
+            r = self._post_json("/api/process", {"names": ["小说.txt"], "op": "压缩连续空行"})
+            self.assertEqual(json.loads(r.read().decode()), {"changed": 1})
+            # 下载
+            data = self._get("/api/download?name=" + urllib.parse.quote("小说.txt")).read().decode()
+            self.assertNotIn("\n\n\n", data)
+            self.assertIn("压缩我。", data)
+            # 统计报告
+            report = self._post_json("/api/report", {"name": "小说.txt"}).read().decode("utf-8")
+            self.assertIn("统计报告", report)
+            # EPUB 导出（ZIP 结构）
+            epub = self._post_json(
+                "/api/export", {"name": "小说.txt", "kind": "epub", "author": "某"}).read()
+            self.assertTrue(epub.startswith(b"PK"))
+            # 章节ZIP（内容仍含章节标题时）
+            zbytes = self._post_json("/api/split", {"name": "小说.txt"}).read()
+            with zipfile.ZipFile(io.BytesIO(zbytes)) as z:
+                self.assertTrue(any("第一章" in n for n in z.namelist()))
+            # 编辑 + 写回（应生成 .bak）
+            self._post_json("/api/content", {"name": "小说.txt", "text": "改写后的内容"})
+            self._post_json("/api/save", {"name": "小说.txt"})
+            self.assertTrue(os.path.exists(src + ".bak"))
+            self.assertEqual(open(src, encoding="utf-8").read(), "改写后的内容")
+            # 删除
+            self._post_json("/api/delete", {"names": ["小说.txt"]})
+            state = json.loads(self._get("/api/state").read().decode())
+            self.assertEqual(state["files"], [])
+
+    def test_upload_multipart(self):
+        boundary = "----testboundary123"
+        body = (f"--{boundary}\r\n"
+                f'Content-Disposition: form-data; name="file"; filename="上传.txt"\r\n'
+                f"Content-Type: text/plain\r\n\r\n"
+                f"上传的内容第二行。\r\n--{boundary}--\r\n").encode("utf-8")
+        r = self._post_raw("/api/upload", body,
+                           {"Content-Type": f"multipart/form-data; boundary={boundary}"})
+        self.assertEqual(json.loads(r.read().decode()), {"added": ["上传.txt"]})
+        state = json.loads(self._get("/api/state").read().decode())
+        self.assertEqual(state["files"][0]["name"], "上传.txt")
+
+    def test_errors(self):
+        r = self._get("/api/content?name=" + urllib.parse.quote("不存在.txt"))
+        self.assertEqual(r.status, 404)
+        r2 = self._post_json("/api/process", {"names": [], "op": "不存在操作"})
+        self.assertEqual(r2.status, 400)
 
 
 if __name__ == "__main__":

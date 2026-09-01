@@ -97,6 +97,7 @@ import argparse
 import codecs
 import difflib
 import html
+import io
 import json
 import math
 import os
@@ -113,6 +114,8 @@ import uuid
 import webbrowser
 import zipfile
 from collections import Counter
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs, quote, urlparse
 import tkinter as tk
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
@@ -1197,6 +1200,214 @@ def format_sensitive_report(results, keywords):
         lines.append("")
     lines.append(f"合计：{grand_total} 处命中")
     return "\n".join(lines)
+
+
+# ------------------------------ 文本处理算子（GUI/CLI/Web 工作台共用） ------------------------------
+def remove_empty_lines(text):
+    """去除空行（保留有效内容行）"""
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    lines = [line for line in text.split("\n") if line.strip()]
+    return "\n".join(lines)
+
+
+def remove_all_spaces(text):
+    """去除所有空格和制表符（保留换行）"""
+    return text.replace(" ", "").replace("\t", "")
+
+
+def remove_date_info(text):
+    """去除常见日期格式"""
+    date_patterns = [
+        r"\d{4}-\d{2}-\d{2}",     # 2025-12-05
+        r"\d{2}/\d{2}/\d{4}",     # 05/12/2025
+        r"\d{4}年\d{1,2}月\d{1,2}日",  # 2025年12月5日
+        r"\d{2}:\d{2}:\d{2}",     # 12:30:45
+        r"\d{4}/\d{2}/\d{2}"      # 2025/12/05
+    ]
+    processed_text = text
+    for pattern in date_patterns:
+        processed_text = re.sub(pattern, "", processed_text)
+    return processed_text
+
+
+def remove_duplicate_lines(text):
+    """去除重复行（保持原有顺序）"""
+    seen = set()
+    result = []
+    for line in text.splitlines():
+        if line not in seen:
+            seen.add(line)
+            result.append(line)
+    return "\n".join(result)
+
+
+def to_uppercase(text):
+    """转换为大写"""
+    return text.upper()
+
+
+def to_lowercase(text):
+    """转换为小写"""
+    return text.lower()
+
+
+def add_paragraph_indent(text):
+    """段首添加两个全角空格（空行保持为空）"""
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    return "\n".join(
+        ("　　" + line.strip()) if line.strip() else ""
+        for line in text.split("\n")
+    )
+
+
+def remove_paragraph_indent(text):
+    """去除段首缩进（半角/全角空格、制表符）"""
+    return "\n".join(line.lstrip(" \t　") for line in text.split("\n"))
+
+
+def fullwidth_to_halfwidth(text):
+    """全角字母/数字转半角（全角空格一并转换；不改动中文标点）"""
+    return text.translate(_FULLWIDTH_TABLE)
+
+
+def unify_cjk_punctuation(text):
+    """把中文之间的半角标点统一为全角（英文单词间、数字间、网址不受影响）"""
+    cjk = r"[\u4e00-\u9fff]"
+    mapping = {",": "，", "!": "！", "?": "？", ";": "；", ":": "：", ".": "。"}
+    for half, full in mapping.items():
+        text = re.sub(rf"(?<={cjk}){re.escape(half)}(?={cjk})", full, text)
+    return text
+
+
+def strip_html_tags(text):
+    """去除HTML标签并还原常见实体"""
+    text = re.sub(r"<[^>]+>", "", text)
+    text = re.sub(
+        r"&#(\d+);",
+        lambda m: chr(int(m.group(1))) if int(m.group(1)) < 0x110000 else "",
+        text
+    )
+    entities = {
+        "&nbsp;": " ", "&amp;": "&", "&lt;": "<", "&gt;": ">",
+        "&quot;": '"', "&apos;": "'", "&ldquo;": "“", "&rdquo;": "”",
+    }
+    for ent, ch in entities.items():
+        text = text.replace(ent, ch)
+    return text
+
+
+def merge_unwanted_newlines(text):
+    """
+    合并非标点后的换行
+    规则：
+    1. 行尾是标点 → 保留换行
+    2. 行尾不是标点 → 合并到下一行（用空格分隔）
+    3. 空行直接移除
+    """
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    lines = text.split("\n")
+
+    if not lines:
+        return ""
+
+    punctuation = "。！？；：，,.!?;:"
+    result = []
+    buffer = ""  # 缓存非标点结尾的行
+
+    for line in lines:
+        line_stripped = line.strip()
+        if not line_stripped:
+            continue  # 跳过空行
+
+        if buffer:
+            line_stripped = f"{buffer} {line_stripped}"
+            buffer = ""
+
+        last_char = line_stripped[-1] if line_stripped else ""
+        if last_char in punctuation:
+            result.append(line_stripped)
+        else:
+            buffer = line_stripped
+
+    if buffer:
+        result.append(buffer)
+
+    return "\n".join(result)
+
+
+def force_newline_after_period(text):
+    """
+    句号后强制换行
+    规则：
+    1. 中文句号（。）后添加换行（排除已有换行的情况）
+    2. 英文句号（.）后添加换行（排除缩写/网址/小数等场景）
+    3. 自动清理句号后的多余空白
+    """
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+
+    if not text:
+        return ""
+
+    result = []
+    i = 0
+    text_length = len(text)
+
+    while i < text_length:
+        char = text[i]
+        result.append(char)
+
+        # 中文句号
+        if char == "。":
+            j = i + 1
+            while j < text_length and text[j] in " \t":
+                j += 1
+            if j < text_length and text[j] != "\n":
+                result.append("\n")
+            i = j
+            continue
+
+        # 英文句号（排除缩写/网址/小数）
+        elif char == ".":
+            skip = False
+            # 形如 U.S. 的大写缩写
+            if i > 1 and text[i - 1].isupper() and text[i - 2].isalpha():
+                skip = True
+            # 后面紧跟字母/数字（网址、小数等）
+            elif i + 1 < text_length and text[i + 1].isalnum():
+                skip = True
+
+            if not skip:
+                j = i + 1
+                while j < text_length and text[j] in " \t":
+                    j += 1
+                if j < text_length and text[j] != "\n":
+                    result.append("\n")
+                i = j
+                continue
+
+        i += 1
+
+    return "".join(result)
+
+
+# Web 工作台可用的处理算子（键为操作名，与 GUI 按钮一致）
+_TEXT_OPS = {
+    "去除空行": remove_empty_lines,
+    "去除所有空格": remove_all_spaces,
+    "去除重复行": remove_duplicate_lines,
+    "去除日期信息": remove_date_info,
+    "压缩连续空行": compress_blank_lines,
+    "清理行首尾空白": strip_line_edges,
+    "转大写": to_uppercase,
+    "转小写": to_lowercase,
+    "全角转半角": fullwidth_to_halfwidth,
+    "段首缩进": add_paragraph_indent,
+    "去除段首缩进": remove_paragraph_indent,
+    "中文标点统一": unify_cjk_punctuation,
+    "去除HTML标签": strip_html_tags,
+    "合并非标点后换行": merge_unwanted_newlines,
+    "句号后强制换行": force_newline_after_period,
+}
 
 
 class TextProcessorApp:
@@ -2779,178 +2990,43 @@ class TextProcessorApp:
             lambda t: "\n".join(line + suffix for line in t.splitlines()), "添加后缀")
 
     def remove_empty_lines(self, text):
-        """去除空行（保留有效内容行）"""
-        text = text.replace("\r\n", "\n").replace("\r", "\n")
-        lines = [line for line in text.split("\n") if line.strip()]
-        return "\n".join(lines)
+        return remove_empty_lines(text)
 
     def remove_all_spaces(self, text):
-        """去除所有空格和制表符（保留换行）"""
-        return text.replace(" ", "").replace("\t", "")
+        return remove_all_spaces(text)
 
     def remove_date_info(self, text):
-        """去除常见日期格式"""
-        date_patterns = [
-            r"\d{4}-\d{2}-\d{2}",     # 2025-12-05
-            r"\d{2}/\d{2}/\d{4}",     # 05/12/2025
-            r"\d{4}年\d{1,2}月\d{1,2}日",  # 2025年12月5日
-            r"\d{2}:\d{2}:\d{2}",     # 12:30:45
-            r"\d{4}/\d{2}/\d{2}"      # 2025/12/05
-        ]
-        processed_text = text
-        for pattern in date_patterns:
-            processed_text = re.sub(pattern, "", processed_text)
-        return processed_text
+        return remove_date_info(text)
 
     def remove_duplicate_lines(self, text):
-        """去除重复行（保持原有顺序）"""
-        seen = set()
-        result = []
-        for line in text.splitlines():
-            if line not in seen:
-                seen.add(line)
-                result.append(line)
-        return "\n".join(result)
+        return remove_duplicate_lines(text)
 
     def to_uppercase(self, text):
-        """转换为大写"""
-        return text.upper()
+        return to_uppercase(text)
 
     def to_lowercase(self, text):
-        """转换为小写"""
-        return text.lower()
+        return to_lowercase(text)
 
     def add_paragraph_indent(self, text):
-        """段首添加两个全角空格（空行保持为空）"""
-        text = text.replace("\r\n", "\n").replace("\r", "\n")
-        return "\n".join(
-            ("　　" + line.strip()) if line.strip() else ""
-            for line in text.split("\n")
-        )
+        return add_paragraph_indent(text)
 
     def remove_paragraph_indent(self, text):
-        """去除段首缩进（半角/全角空格、制表符）"""
-        return "\n".join(line.lstrip(" \t　") for line in text.split("\n"))
+        return remove_paragraph_indent(text)
 
     def fullwidth_to_halfwidth(self, text):
-        """全角字母/数字转半角（全角空格一并转换；不改动中文标点）"""
-        return text.translate(_FULLWIDTH_TABLE)
+        return fullwidth_to_halfwidth(text)
 
     def unify_cjk_punctuation(self, text):
-        """把中文之间的半角标点统一为全角（英文单词间、数字间、网址不受影响）"""
-        cjk = r"[\u4e00-\u9fff]"
-        mapping = {",": "，", "!": "！", "?": "？", ";": "；", ":": "：", ".": "。"}
-        for half, full in mapping.items():
-            text = re.sub(rf"(?<={cjk}){re.escape(half)}(?={cjk})", full, text)
-        return text
+        return unify_cjk_punctuation(text)
 
     def strip_html_tags(self, text):
-        """去除HTML标签并还原常见实体"""
-        text = re.sub(r"<[^>]+>", "", text)
-        text = re.sub(
-            r"&#(\d+);",
-            lambda m: chr(int(m.group(1))) if int(m.group(1)) < 0x110000 else "",
-            text
-        )
-        entities = {
-            "&nbsp;": " ", "&amp;": "&", "&lt;": "<", "&gt;": ">",
-            "&quot;": '"', "&apos;": "'", "&ldquo;": "“", "&rdquo;": "”",
-        }
-        for ent, ch in entities.items():
-            text = text.replace(ent, ch)
-        return text
+        return strip_html_tags(text)
 
     def merge_unwanted_newlines(self, text):
-        """
-        合并非标点后的换行
-        规则：
-        1. 行尾是标点 → 保留换行
-        2. 行尾不是标点 → 合并到下一行（用空格分隔）
-        3. 空行直接移除
-        """
-        text = text.replace("\r\n", "\n").replace("\r", "\n")
-        lines = text.split("\n")
-
-        if not lines:
-            return ""
-
-        punctuation = "。！？；：，,.!?;:"
-        result = []
-        buffer = ""  # 缓存非标点结尾的行
-
-        for line in lines:
-            line_stripped = line.strip()
-            if not line_stripped:
-                continue  # 跳过空行
-
-            if buffer:
-                line_stripped = f"{buffer} {line_stripped}"
-                buffer = ""
-
-            last_char = line_stripped[-1] if line_stripped else ""
-            if last_char in punctuation:
-                result.append(line_stripped)
-            else:
-                buffer = line_stripped
-
-        if buffer:
-            result.append(buffer)
-
-        return "\n".join(result)
+        return merge_unwanted_newlines(text)
 
     def force_newline_after_period(self, text):
-        """
-        句号后强制换行
-        规则：
-        1. 中文句号（。）后添加换行（排除已有换行的情况）
-        2. 英文句号（.）后添加换行（排除缩写/网址/小数等场景）
-        3. 自动清理句号后的多余空白
-        """
-        text = text.replace("\r\n", "\n").replace("\r", "\n")
-
-        if not text:
-            return ""
-
-        result = []
-        i = 0
-        text_length = len(text)
-
-        while i < text_length:
-            char = text[i]
-            result.append(char)
-
-            # 中文句号
-            if char == "。":
-                j = i + 1
-                while j < text_length and text[j] in " \t":
-                    j += 1
-                if j < text_length and text[j] != "\n":
-                    result.append("\n")
-                i = j
-                continue
-
-            # 英文句号（排除缩写/网址/小数）
-            elif char == ".":
-                skip = False
-                # 形如 U.S. 的大写缩写
-                if i > 1 and text[i - 1].isupper() and text[i - 2].isalpha():
-                    skip = True
-                # 后面紧跟字母/数字（网址、小数等）
-                elif i + 1 < text_length and text[i + 1].isalnum():
-                    skip = True
-
-                if not skip:
-                    j = i + 1
-                    while j < text_length and text[j] in " \t":
-                        j += 1
-                    if j < text_length and text[j] != "\n":
-                        result.append("\n")
-                    i = j
-                    continue
-
-            i += 1
-
-        return "".join(result)
+        return force_newline_after_period(text)
 
     # ------------------------------ 小说清洗 ------------------------------
     def process_filter_ad_lines(self):
@@ -3748,7 +3824,7 @@ class TextProcessorApp:
 # ------------------------------ 命令行模式 ------------------------------
 # 不启动界面，便于脚本化批量处理；不带参数运行仍是图形界面
 _CLI_COMMANDS = {"split", "epub", "docx", "epub2txt", "dedup", "sort",
-                 "adfilter", "convert", "stats", "hex", "diff", "version", "sensitive"}
+                 "adfilter", "convert", "stats", "hex", "diff", "version", "sensitive", "serve"}
 
 
 def _cli_inplace_write(path, content, encode):
@@ -4036,6 +4112,11 @@ def _cli_cmd_sensitive(args):
     return 0
 
 
+def _cli_cmd_serve(args):
+    WebWorkbench(port=args.port, open_browser=not args.no_browser).start()
+    return 0
+
+
 def build_cli_parser():
     parser = argparse.ArgumentParser(
         prog="全能TXT文本处理器",
@@ -4139,6 +4220,11 @@ def build_cli_parser():
     p.add_argument("--encoding", default="utf-8")
     p.set_defaults(func=_cli_cmd_sensitive)
 
+    p = sub.add_parser("serve", help="启动本地 Web 工作台（浏览器操作，仅监听 127.0.0.1）")
+    p.add_argument("--port", type=int, default=8765, help="监听端口（默认 8765）")
+    p.add_argument("--no-browser", action="store_true", help="启动后不自动打开浏览器")
+    p.set_defaults(func=_cli_cmd_serve)
+
     return parser
 
 
@@ -4158,6 +4244,422 @@ def cli_main(argv=None):
     except Exception as e:
         print(f"错误：{e}", file=sys.stderr)
         return 1
+
+
+# ------------------------------ Web 工作台（serve 子命令） ------------------------------
+# 仅监听 127.0.0.1 的本地浏览器操作台：零依赖 http.server，数据不离开本机
+_WEB_PAGE = """<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<title>全能TXT文本处理器 · Web 工作台</title>
+<style>
+ body { margin:0; font-family:"Microsoft YaHei UI",sans-serif; background:#0F172A; color:#E2E8F0; }
+ header { background:#2563EB; color:#fff; padding:10px 18px; font-size:18px; font-weight:bold; }
+ header span { float:right; font-size:12px; font-weight:normal; }
+ .wrap { display:flex; gap:14px; padding:14px; height:calc(100vh - 110px); box-sizing:border-box; }
+ .left { width:330px; display:flex; flex-direction:column; gap:10px; }
+ .card { background:#1E293B; border:1px solid #334155; border-radius:10px; padding:10px; }
+ select,input,button,textarea { font-family:inherit; font-size:14px; background:#0F172A; color:#E2E8F0;
+   border:1px solid #334155; border-radius:6px; padding:6px; }
+ button { cursor:pointer; } button:hover { background:#334155; }
+ button.primary { background:#2563EB; border-color:#2563EB; }
+ button.primary:hover { background:#1D4ED8; }
+ .row { display:flex; gap:6px; flex-wrap:wrap; align-items:center; margin-top:6px; }
+ .muted { color:#94A3B8; font-size:12px; }
+ #list { flex:1; overflow:auto; min-height:100px; }
+ #list div { padding:4px 8px; border-radius:4px; cursor:pointer; }
+ #list div.sel { background:#1E3A8A; }
+ .center { flex:1; display:flex; flex-direction:column; gap:8px; min-width:0; }
+ textarea { width:100%; flex:1; box-sizing:border-box; resize:none; white-space:pre; }
+</style>
+</head>
+<body>
+<header>全能TXT文本处理器 · Web 工作台 <span>仅监听 127.0.0.1 · 数据不离开本机 · Ctrl+C 停止</span></header>
+<div class="wrap">
+ <div class="left">
+  <div class="card">
+   <div class="muted">从服务器磁盘打开（多个用分号分隔）</div>
+   <div class="row"><input id="path" placeholder="例如 D:\\books\\小说.txt" style="flex:1">
+     <button onclick="openLocal()">打开</button></div>
+   <div class="row"><input type="file" id="up" multiple accept=".txt">
+     <button onclick="upload()">上传所选</button></div>
+  </div>
+  <div class="card" style="flex:1;display:flex;flex-direction:column">
+   <div class="muted">文件列表（点击载入编辑）</div>
+   <div id="list"></div>
+  </div>
+  <div class="card">
+   <div class="row"><button onclick="downloadSel()">下载选中</button>
+     <button onclick="saveBack()">写回原文件</button>
+     <button onclick="delSel()">删除</button></div>
+   <div class="row"><select id="op" style="flex:1"></select>
+     <button class="primary" onclick="applyOp()">应用到选中</button></div>
+  </div>
+  <div class="card">
+   <div class="row"><input id="title" placeholder="书名（可空）" style="flex:1">
+     <input id="author" placeholder="作者" style="width:90px"></div>
+   <div class="row"><button onclick="exportBook('epub')">导出EPUB</button>
+     <button onclick="exportBook('docx')">导出DOCX</button>
+     <button onclick="exportZip()">章节ZIP</button>
+     <button onclick="exportReport()">统计报告</button></div>
+  </div>
+ </div>
+ <div class="center">
+  <div class="muted" id="status">就绪</div>
+  <textarea id="editor" spellcheck="false"></textarea>
+  <div class="row"><button class="primary" onclick="saveEditor()">保存到内存</button>
+    <span class="muted">编辑仅更新内存；「写回原文件」会自动生成 .bak 备份</span></div>
+ </div>
+</div>
+<script>
+let files = [], sel = null;
+const $ = id => document.getElementById(id);
+async function api(path, body) {
+  const opt = body === undefined ? {} :
+    { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) };
+  const r = await fetch(path, opt);
+  if (!r.ok) { const e = await r.json().catch(() => ({})); throw new Error(e.error || r.statusText); }
+  return r;
+}
+async function refresh() { files = (await (await api("/api/state")).json()).files; render(); }
+function render() {
+  const el = $("list"); el.innerHTML = "";
+  files.forEach(f => {
+    const d = document.createElement("div");
+    d.textContent = f.name + (f.path ? "" : "（上传）");
+    if (f.name === sel) d.className = "sel";
+    d.onclick = () => pick(f.name);
+    el.appendChild(d);
+  });
+}
+async function pick(name) {
+  sel = name; render();
+  const data = await (await api("/api/content?name=" + encodeURIComponent(name))).json();
+  $("editor").value = data.text;
+  $("status").textContent = "已载入 " + name + "（" + data.text.length + " 字符）";
+}
+async function openLocal() {
+  const p = $("path").value.trim(); if (!p) return;
+  for (const one of p.split(/[;；]/).map(s => s.trim()).filter(Boolean)) {
+    const r = await api("/api/open_local", { path: one });
+    const data = await r.json();
+    await refresh(); await pick(data.name);
+  }
+}
+async function upload() {
+  for (const f of $("up").files) {
+    const fd = new FormData(); fd.append("file", f);
+    await fetch("/api/upload", { method: "POST", body: fd });
+  }
+  await refresh(); $("status").textContent = "上传完成";
+}
+function selName() { if (!sel) { alert("请先在列表中选择文件"); throw new Error("no selection"); } return sel; }
+async function applyOp() {
+  const name = selName(), op = $("op").value;
+  const r = await api("/api/process", { names: [name], op });
+  $("status").textContent = "已应用：" + op;
+  await pick(name);
+}
+async function saveEditor() { await api("/api/content", { name: selName(), text: $("editor").value }); $("status").textContent = "已保存到内存"; }
+async function saveBack() { const r = await api("/api/save", { name: selName() }); const d = await r.json(); $("status").textContent = "已写回：" + d.path; }
+async function downloadSel() { location = "/api/download?name=" + encodeURIComponent(selName()); }
+async function delSel() { await api("/api/delete", { names: [selName()] }); sel = null; $("editor").value = ""; await refresh(); }
+async function exportBook(kind) {
+  const r = await api("/api/export", { name: selName(), kind, title: $("title").value, author: $("author").value });
+  triggerDL(await r.blob(), sel.replace(/\\.txt$/i, "") + "." + kind);
+}
+async function exportZip() {
+  const r = await api("/api/split", { name: selName() });
+  triggerDL(await r.blob(), sel.replace(/\\.txt$/i, "") + "_章节.zip");
+}
+async function exportReport() {
+  const r = await api("/api/report", { name: selName() });
+  triggerDL(await r.blob(), sel.replace(/\\.txt$/i, "") + "_报告.html");
+}
+function triggerDL(blob, name) {
+  const a = document.createElement("a"); a.href = URL.createObjectURL(blob); a.download = name; a.click();
+}
+window.onload = async () => {
+  const ops = (await (await api("/api/ops")).json()).ops;
+  ops.forEach(o => { const o2 = document.createElement("option"); o2.textContent = o; $("op").appendChild(o2); });
+  await refresh();
+};
+</script>
+</body>
+</html>"""
+
+
+def smart_decode(data):
+    """按常见编码尝试解码字节串（utf-8-sig / utf-16 / gbk / cp1252），失败用替换符兜底"""
+    for enc in ("utf-8-sig", "utf-16", "gbk", "cp1252"):
+        try:
+            return data.decode(enc)
+        except (UnicodeDecodeError, LookupError):
+            continue
+    return data.decode("utf-8", errors="replace")
+
+
+def parse_multipart(body, content_type):
+    """解析 multipart/form-data 上传体。返回 [(文件名, 字节内容)]（仅取带 filename 的部分）。"""
+    m = re.search(r'boundary="?([^";]+)"?', content_type or "")
+    if not m:
+        return []
+    boundary = ("--" + m.group(1)).encode("utf-8")
+    parts = []
+    for section in body.split(boundary):
+        section = section.strip(b"\r\n")
+        if not section or section == b"--":
+            continue
+        if b"\r\n\r\n" not in section:
+            continue
+        head, payload = section.split(b"\r\n\r\n", 1)
+        fm = re.search(rb'filename="([^"]*)"', head)
+        if not fm:
+            continue
+        filename = fm.group(1).decode("utf-8", errors="replace")
+        if payload.endswith(b"\r\n"):
+            payload = payload[:-2]
+        parts.append((filename, payload))
+    return parts
+
+
+class WebWorkbench:
+    """本地浏览器工作台。会话文件保存在内存，仅监听 127.0.0.1。"""
+
+    def __init__(self, port=8765, open_browser=True):
+        self.port = port
+        self.open_browser = open_browser
+        self.files = {}   # 文件名 -> 文本内容（会话内存）
+        self.paths = {}   # 文件名 -> 本地磁盘路径（仅 /api/open_local 打开的文件有）
+        self.lock = threading.Lock()
+
+    def make_server(self):
+        return ThreadingHTTPServer(("127.0.0.1", self.port), self._make_handler())
+
+    def start(self):
+        server = self.make_server()
+        url = f"http://127.0.0.1:{server.server_address[1]}/"
+        print(f"Web 工作台已启动：{url}（按 Ctrl+C 停止）")
+        if self.open_browser:
+            webbrowser.open(url)
+        try:
+            server.serve_forever()
+        except KeyboardInterrupt:
+            print("\nWeb 工作台已停止")
+
+    def _make_handler(self):
+        workbench = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, fmt, *args):
+                pass  # 静默访问日志
+
+            # ---------- 响应工具 ----------
+            def _json(self, obj, status=200):
+                data = json.dumps(obj, ensure_ascii=False).encode("utf-8")
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+            def _attachment(self, data, filename, mime="application/octet-stream"):
+                self.send_response(200)
+                self.send_header("Content-Type", mime)
+                self.send_header("Content-Disposition",
+                                 f"attachment; filename*=UTF-8''{quote(filename)}")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+            def _page(self):
+                data = _WEB_PAGE.encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+            def _body_json(self):
+                length = int(self.headers.get("Content-Length", 0) or 0)
+                if not length:
+                    return {}
+                return json.loads(self.rfile.read(length).decode("utf-8"))
+
+            def _get_name(self, qs):
+                name = qs.get("name", [""])[0]
+                with workbench.lock:
+                    text = workbench.files.get(name)
+                return name, text
+
+            # ---------- GET ----------
+            def do_GET(self):
+                try:
+                    parsed = urlparse(self.path)
+                    qs = parse_qs(parsed.query)
+                    if parsed.path == "/":
+                        self._page()
+                    elif parsed.path == "/api/state":
+                        with workbench.lock:
+                            files = [{"name": n, "size": len(c),
+                                      "path": workbench.paths.get(n, "")}
+                                     for n, c in workbench.files.items()]
+                        self._json({"files": files})
+                    elif parsed.path == "/api/ops":
+                        self._json({"ops": list(_TEXT_OPS)})
+                    elif parsed.path == "/api/content":
+                        name, text = self._get_name(qs)
+                        if text is None:
+                            self._json({"error": "文件不存在"}, 404)
+                        else:
+                            self._json({"name": name, "text": text})
+                    elif parsed.path == "/api/download":
+                        name, text = self._get_name(qs)
+                        if text is None:
+                            self._json({"error": "文件不存在"}, 404)
+                        else:
+                            self._attachment(text.encode("utf-8"), name,
+                                             "text/plain; charset=utf-8")
+                    else:
+                        self._json({"error": "未知路径"}, 404)
+                except Exception as e:
+                    self._json({"error": str(e)}, 500)
+
+            # ---------- POST ----------
+            def do_POST(self):
+                try:
+                    parsed = urlparse(self.path)
+                    if parsed.path == "/api/upload":
+                        length = int(self.headers.get("Content-Length", 0) or 0)
+                        added = []
+                        for filename, payload in parse_multipart(
+                                self.rfile.read(length), self.headers.get("Content-Type", "")):
+                            name = os.path.basename(filename) or f"上传_{len(added) + 1}.txt"
+                            with workbench.lock:
+                                workbench.files[name] = smart_decode(payload)
+                            added.append(name)
+                        self._json({"added": added})
+                        return
+                    body = self._body_json()
+                    name = body.get("name", "")
+                    if parsed.path == "/api/open_local":
+                        path = (body.get("path") or "").strip()
+                        if not path:
+                            self._json({"error": "路径为空"}, 400)
+                            return
+                        content, enc = read_text_smart(path, "utf-8")
+                        name = os.path.basename(path)
+                        with workbench.lock:
+                            workbench.files[name] = content
+                            workbench.paths[name] = path
+                        self._json({"name": name, "encoding": enc})
+                    elif parsed.path == "/api/content":
+                        with workbench.lock:
+                            if name not in workbench.files:
+                                self._json({"error": "文件不存在"}, 404)
+                                return
+                            workbench.files[name] = body.get("text", "")
+                        self._json({"ok": True})
+                    elif parsed.path == "/api/process":
+                        op = body.get("op", "")
+                        func = _TEXT_OPS.get(op)
+                        if not func:
+                            self._json({"error": f"未知操作：{op}"}, 400)
+                            return
+                        changed = 0
+                        with workbench.lock:
+                            for n in body.get("names", []):
+                                if n in workbench.files:
+                                    workbench.files[n] = func(workbench.files[n])
+                                    changed += 1
+                        self._json({"changed": changed})
+                    elif parsed.path == "/api/save":
+                        with workbench.lock:
+                            text = workbench.files.get(name)
+                            path = workbench.paths.get(name)
+                        if text is None or not path:
+                            self._json({"error": "文件不存在或不是本地打开的文件"}, 404)
+                            return
+                        _cli_inplace_write(path, text, "utf-8")
+                        self._json({"ok": True, "path": path})
+                    elif parsed.path == "/api/delete":
+                        with workbench.lock:
+                            for n in body.get("names", []):
+                                workbench.files.pop(n, None)
+                                workbench.paths.pop(n, None)
+                        self._json({"ok": True})
+                    elif parsed.path == "/api/export":
+                        with workbench.lock:
+                            text = workbench.files.get(name)
+                        if text is None:
+                            self._json({"error": "文件不存在"}, 404)
+                            return
+                        stem = os.path.splitext(name)[0] or name
+                        title = (body.get("title") or "").strip() or stem
+                        author = (body.get("author") or "").strip()
+                        pattern = re.compile(_CHAPTER_PRESETS["第X章+序章/楔子/番外"])
+                        blocks = split_chapters_by_pattern(text, pattern)
+                        chapters = [("前言", b) if t is None else (t, b)
+                                    for t, b in blocks if b.strip()]
+                        if not chapters:
+                            self._json({"error": "内容为空"}, 400)
+                            return
+                        kind = "docx" if body.get("kind") == "docx" else "epub"
+                        with tempfile.TemporaryDirectory() as td:
+                            out = os.path.join(td, "out." + kind)
+                            if kind == "docx":
+                                build_docx(out, title, chapters, author=author)
+                                mime = ("application/vnd.openxmlformats-officedocument"
+                                        ".wordprocessingml.document")
+                            else:
+                                build_epub(out, title, chapters, author=author)
+                                mime = "application/epub+zip"
+                            with open(out, "rb") as f:
+                                data = f.read()
+                        self._attachment(data, f"{stem}.{kind}", mime)
+                    elif parsed.path == "/api/split":
+                        with workbench.lock:
+                            text = workbench.files.get(name)
+                        if text is None:
+                            self._json({"error": "文件不存在"}, 404)
+                            return
+                        pattern = (re.compile(body["pattern"]) if body.get("pattern")
+                                   else re.compile(_CHAPTER_PRESETS.get(
+                                       body.get("preset", ""), _CHAPTER_PRESETS["第X章+序章/楔子/番外"])))
+                        stem = os.path.splitext(name)[0] or name
+                        buf = io.BytesIO()
+                        seq = 0
+                        with zipfile.ZipFile(buf, "w") as z:
+                            for t, b in split_chapters_by_pattern(text, pattern):
+                                btext = b.strip()
+                                if t is None:
+                                    if not btext:
+                                        continue
+                                    fname, wtext = f"{stem}_00_开头.txt", btext
+                                else:
+                                    seq += 1
+                                    safe = re.sub(r'[\\/:*?"<>|\s]+', "_", t)
+                                    fname, wtext = f"{stem}_{seq:03d}_{safe}.txt", f"{t}\n\n{btext}"
+                                z.writestr(fname, wtext)
+                        self._attachment(buf.getvalue(), f"{stem}_章节.zip", "application/zip")
+                    elif parsed.path == "/api/report":
+                        with workbench.lock:
+                            text = workbench.files.get(name)
+                        if text is None:
+                            self._json({"error": "文件不存在"}, 404)
+                            return
+                        stem = os.path.splitext(name)[0] or name
+                        report = build_text_report(
+                            text, stem, re.compile(_CHAPTER_PRESETS["第X章+序章/楔子/番外"]))
+                        self._attachment(report.encode("utf-8"), f"{stem}_报告.html",
+                                         "text/html; charset=utf-8")
+                    else:
+                        self._json({"error": "未知路径"}, 404)
+                except Exception as e:
+                    self._json({"error": str(e)}, 500)
+
+        return Handler
 
 
 # ------------------------------ 程序入口 ------------------------------

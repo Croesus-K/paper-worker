@@ -1,6 +1,6 @@
 # paper-worker —— 全能TXT文本处理器
 
-> 绿色单文件的中文 TXT 批量处理工具 —— 编码转换、批量查找替换、章节分割、合并、内容提取、小说清洗、EPUB 导出、可视化统计、十六进制/差异对比，全程只动内存，保存才写盘。
+> 绿色单文件的中文 TXT 批量处理工具 —— 编码转换、批量查找替换、章节分割、合并、内容提取、小说清洗、EPUB/DOCX 导出、可视化统计、十六进制/差异对比、Web 工作台，全程只动内存，保存才写盘。
 
 一个为处理大量 TXT 文本（小说章节、日志、语料等）设计的桌面工具：把一批文件拖进来，统一转码、清洗、切割、合并，确认无误后再一次性写回磁盘。
 
@@ -72,11 +72,25 @@
 
 所有处理**仅修改内存**，需要手动"保存到原文件"或"另存为新文件"才会写盘；写回原文件前会自动生成一次 `.bak` 备份（按字节复制，原样保留原始内容）。保存时可选择换行符格式（系统默认 / LF / CRLF）。
 
+## Web 工作台（v2.11 新增）
+
+```bash
+python 全能TXT文本处理器.py serve            # 启动后自动打开浏览器，Ctrl+C 停止
+python 全能TXT文本处理器.py serve --port 9000 --no-browser
+```
+
+- 浏览器里的完整操作台：本地打开/上传 TXT → 在线编辑 → 一键应用全部文本处理与小说清洗算子 → 下载/写回原文件（自动 .bak 备份）
+- 在线导出：EPUB / DOCX / 章节ZIP / 统计报告
+- 纯标准库 `http.server` 实现，零依赖；**仅监听 127.0.0.1**，数据不离开本机
+
 ## 运行环境与使用
 
-**方式一：直接下载 exe（推荐，无需 Python）**
+**方式一：直接下载（推荐，无需 Python）**
 
-到 [Releases](https://github.com/Croesus-K/paper-worker/releases) 下载 `全能TXT文本处理器.exe`，双击即用（已内置拖放支持，杀软若误报请添加信任）。
+到 [Releases](https://github.com/Croesus-K/paper-worker/releases) 下载对应平台的单文件程序，双击即用（已内置拖放支持，杀软若误报请添加信任）：
+
+- Windows：`PaperWorker-*-windows.exe`
+- Linux / macOS：`PaperWorker-*-linux` / `PaperWorker-*-macos`（`chmod +x` 后运行，需要图形环境）
 
 **方式二：从源码运行**
 
@@ -143,6 +157,9 @@ python 全能TXT文本处理器.py epub2txt 小说.epub --out 小说.txt
 
 # 敏感词检查（词表每行一个，stdout 输出报告，--out 写文件）
 python 全能TXT文本处理器.py sensitive 小说.txt --words-file 词表.txt
+
+# 启动 Web 工作台（浏览器操作，见上文专节）
+python 全能TXT文本处理器.py serve
 
 # 全部子命令支持 --pattern 自定义章节正则、--encoding 指定读取编码
 python 全能TXT文本处理器.py --help
