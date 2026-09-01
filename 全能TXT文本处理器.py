@@ -82,6 +82,13 @@
  38. 新增 敏感词检查：自定义词表（随设置记忆/可从文件导入），定位所有包含敏感词的行
      （大小写不敏感，只读分析不修改内容），结果弹窗支持复制/另存；CLI sensitive 子命令
 
+2.11 新增：
+ 39. 深色主题：标题栏右侧设置区主题下拉切换（浅色/深色，重启生效），全套控件配色适配
+ 40. 跨平台发布：CI 同步构建 Windows/Linux/macOS 三平台单文件程序，测试通过才发版
+ 41. Web 工作台：CLI serve 启动本地浏览器操作台（仅监听 127.0.0.1，零依赖 http.server）——
+     本地打开/上传 TXT → 在线编辑 → 全部文本处理/小说清洗 → 下载/写回，
+     并可在线导出 EPUB/DOCX/章节 ZIP/统计报告
+
 所有处理仅修改内存，需手动"保存到原文件"或"另存为新文件"才会写盘。
 运行依赖：tkinterdnd2（可选，pip install tkinterdnd2，用于拖放）
 """
@@ -116,10 +123,35 @@ except ImportError:
     DND_AVAILABLE = False
 
 # 默认窗口标题
-_APP_VERSION = "2.10"
+_APP_VERSION = "2.11"
 DEFAULT_TITLE = f"全能TXT文本处理器 {_APP_VERSION}"
 
-# ------------------------------ 界面主题配色（扁平化浅色主题） ------------------------------
+# ------------------------------ 界面主题配色（可切换浅色/深色） ------------------------------
+_THEMES = {
+    "浅色": {"COLOR_BG": "#EEF1F5", "COLOR_CARD": "#FFFFFF", "COLOR_BORDER": "#D9DEE7",
+            "COLOR_PRIMARY": "#2563EB", "COLOR_PRIMARY_D": "#1D4ED8", "COLOR_PRIMARY_L": "#DBEAFE",
+            "COLOR_TEXT": "#1F2937", "COLOR_MUTED": "#6B7280", "COLOR_DISABLE": "#9CA3AF",
+            "COLOR_HEADER_SUB": "#BFDBFE", "COLOR_TAB_BG": "#E2E7EF",
+            "COLOR_BTN_PRESSED": "#E5E7EB", "COLOR_BTN_HOVER": "#F3F4F6",
+            "COLOR_BTN_DISABLE_BG": "#F9FAFB",
+            "COLOR_SCROLLBAR": "#CBD5E1", "COLOR_SCROLLBAR_HOVER": "#94A3B8"},
+    "深色": {"COLOR_BG": "#0F172A", "COLOR_CARD": "#1E293B", "COLOR_BORDER": "#334155",
+            "COLOR_PRIMARY": "#3B82F6", "COLOR_PRIMARY_D": "#2563EB", "COLOR_PRIMARY_L": "#1E3A8A",
+            "COLOR_TEXT": "#E2E8F0", "COLOR_MUTED": "#94A3B8", "COLOR_DISABLE": "#64748B",
+            "COLOR_HEADER_SUB": "#93C5FD", "COLOR_TAB_BG": "#172033",
+            "COLOR_BTN_PRESSED": "#334155", "COLOR_BTN_HOVER": "#273449",
+            "COLOR_BTN_DISABLE_BG": "#172033",
+            "COLOR_SCROLLBAR": "#475569", "COLOR_SCROLLBAR_HOVER": "#64748B"},
+}
+
+
+def _apply_palette(name):
+    """把主题色写入模块级 COLOR_* 常量。需在构建界面前调用；运行中切换需重启。"""
+    palette = _THEMES.get(name) or _THEMES["浅色"]
+    globals().update(palette)
+
+
+# 默认色板（浅色）——启动时会按设置覆盖
 COLOR_BG        = "#EEF1F5"   # 页面背景
 COLOR_CARD      = "#FFFFFF"   # 卡片背景
 COLOR_BORDER    = "#D9DEE7"   # 边框
@@ -129,6 +161,13 @@ COLOR_PRIMARY_L = "#DBEAFE"   # 主色浅（列表选中背景）
 COLOR_TEXT      = "#1F2937"   # 主文字
 COLOR_MUTED     = "#6B7280"   # 次要文字
 COLOR_DISABLE   = "#9CA3AF"   # 禁用文字
+COLOR_HEADER_SUB = "#BFDBFE"  # 标题栏副标题
+COLOR_TAB_BG    = "#E2E7EF"   # 标签页未选中背景
+COLOR_BTN_PRESSED = "#E5E7EB"
+COLOR_BTN_HOVER   = "#F3F4F6"
+COLOR_BTN_DISABLE_BG = "#F9FAFB"
+COLOR_SCROLLBAR = "#CBD5E1"
+COLOR_SCROLLBAR_HOVER = "#94A3B8"
 
 # 全角字母/数字 -> 半角 转换表（不动中文标点，避免破坏中文文本）
 _FULLWIDTH_TABLE = {}
@@ -1167,6 +1206,18 @@ class TextProcessorApp:
         self.root.geometry("1240x860")
         self.root.resizable(True, True)
 
+        # 主题需在构建界面前确定（运行中切换主题需重启生效）
+        theme_name = "浅色"
+        try:
+            with open(self._settings_path, "r", encoding="utf-8") as f:
+                saved = json.load(f).get("theme")
+            if saved in _THEMES:
+                theme_name = saved
+        except Exception:
+            pass
+        _apply_palette(theme_name)
+        self.theme_var = tk.StringVar(value=theme_name)
+
         # 高DPI适配
         self.enable_high_dpi()
 
@@ -1310,7 +1361,8 @@ class TextProcessorApp:
         cfg("TButton", background=COLOR_CARD, foreground=COLOR_TEXT, bordercolor=COLOR_BORDER,
             focuscolor=COLOR_PRIMARY, padding=(8, 4), relief="flat")
         mp("TButton",
-           background=[("pressed", "#E5E7EB"), ("active", "#F3F4F6"), ("disabled", "#F9FAFB")],
+           background=[("pressed", COLOR_BTN_PRESSED), ("active", COLOR_BTN_HOVER),
+                       ("disabled", COLOR_BTN_DISABLE_BG)],
            foreground=[("disabled", COLOR_DISABLE)],
            bordercolor=[("active", COLOR_PRIMARY)])
 
@@ -1345,14 +1397,14 @@ class TextProcessorApp:
         # 进度条 / 滚动条 / 分隔线
         cfg("Horizontal.TProgressbar", background=COLOR_PRIMARY, troughcolor=COLOR_BORDER,
             bordercolor=COLOR_CARD, lightcolor=COLOR_PRIMARY, darkcolor=COLOR_PRIMARY)
-        cfg("TScrollbar", background="#CBD5E1", troughcolor=COLOR_CARD,
+        cfg("TScrollbar", background=COLOR_SCROLLBAR, troughcolor=COLOR_CARD,
             bordercolor=COLOR_CARD, arrowcolor=COLOR_MUTED, relief="flat")
-        mp("TScrollbar", background=[("active", "#94A3B8")])
+        mp("TScrollbar", background=[("active", COLOR_SCROLLBAR_HOVER)])
         cfg("TSeparator", background=COLOR_BORDER)
 
         # 标签页
         cfg("TNotebook", background=COLOR_BG, bordercolor=COLOR_BORDER, tabmargins=(6, 6, 6, 0))
-        cfg("TNotebook.Tab", padding=(18, 7), background="#E2E7EF", foreground=COLOR_MUTED,
+        cfg("TNotebook.Tab", padding=(18, 7), background=COLOR_TAB_BG, foreground=COLOR_MUTED,
             font=(face, 10, "bold"))
         mp("TNotebook.Tab", background=[("selected", COLOR_CARD)],
            foreground=[("selected", COLOR_PRIMARY)])
@@ -1431,6 +1483,9 @@ class TextProcessorApp:
         newline_mode = settings.get("newline_mode")
         if newline_mode in ("默认", "LF (Unix)", "CRLF (Windows)"):
             self.newline_var.set(newline_mode)
+        theme = settings.get("theme")
+        if theme in _THEMES:
+            self.theme_var.set(theme)
         words = settings.get("ad_filter_words")
         if isinstance(words, list):
             self.ad_filter_words = [str(w) for w in words if str(w).strip()]
@@ -1448,6 +1503,7 @@ class TextProcessorApp:
                     "encoding": self.encode_var.get(),
                     "geometry": self.root.geometry(),
                     "newline_mode": self.newline_var.get(),
+                    "theme": self.theme_var.get(),
                     "ad_filter_words": self.ad_filter_words,
                     "ad_whole_line": self.ad_whole_line,
                     "epub_author": self.epub_author,
@@ -1476,8 +1532,8 @@ class TextProcessorApp:
         header_inner.pack(fill=tk.X, padx=14, pady=8)
         tk.Label(header_inner, text="全能TXT文本处理器", bg=COLOR_PRIMARY, fg="#FFFFFF",
                  font=(face, 15, "bold")).pack(side=tk.LEFT)
-        tk.Label(header_inner, text="v2.10 · 仅修改内存 · 手动保存", bg=COLOR_PRIMARY,
-                 fg="#BFDBFE", font=(face, 9)).pack(side=tk.LEFT, padx=(10, 0), pady=(4, 0))
+        tk.Label(header_inner, text=f"v{_APP_VERSION} · 仅修改内存 · 手动保存", bg=COLOR_PRIMARY,
+                 fg=COLOR_HEADER_SUB, font=(face, 9)).pack(side=tk.LEFT, padx=(10, 0), pady=(4, 0))
         # 检查更新（标题栏右侧扁平小按钮）
         tk.Button(header_inner, text="检查更新", command=self.check_update,
                   bg=COLOR_PRIMARY, fg="#FFFFFF", relief="flat", bd=0,
@@ -1746,15 +1802,25 @@ class TextProcessorApp:
         )
         self.progress_bar.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=3)
 
-        # 换行符选项（影响"保存到原文件/另存为新文件"的写盘格式）
+        # 换行符选项（影响"保存到原文件/另存为新文件"的写盘格式）+ 主题切换
         newline_frame = ttk.Frame(save_group)
-        newline_frame.pack(fill=tk.X, pady=(2, 8), padx=4)
+        newline_frame.pack(fill=tk.X, pady=(2, 2), padx=4)
         ttk.Label(newline_frame, text="换行符", style="Muted.TLabel", width=5).pack(side=tk.LEFT)
         newline_combo = ttk.Combobox(
             newline_frame, textvariable=self.newline_var,
             values=["默认", "LF (Unix)", "CRLF (Windows)"], state="readonly", width=14)
         newline_combo.pack(side=tk.LEFT, padx=3)
         ttk.Label(newline_frame, text="（保存到原文件/另存时生效）",
+                  style="Muted.TLabel").pack(side=tk.LEFT, padx=3)
+
+        theme_frame = ttk.Frame(save_group)
+        theme_frame.pack(fill=tk.X, pady=(2, 8), padx=4)
+        ttk.Label(theme_frame, text="主题", style="Muted.TLabel", width=5).pack(side=tk.LEFT)
+        theme_combo = ttk.Combobox(
+            theme_frame, textvariable=self.theme_var,
+            values=list(_THEMES), state="readonly", width=14)
+        theme_combo.pack(side=tk.LEFT, padx=3)
+        ttk.Label(theme_frame, text="（切换后重启程序生效）",
                   style="Muted.TLabel").pack(side=tk.LEFT, padx=3)
 
         # 固定卡片底部锚定（pack 顺序决定视觉顺序：保存最底、处理贴住编辑区）
