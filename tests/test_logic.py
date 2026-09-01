@@ -3,6 +3,7 @@
 import importlib.util
 import os
 import re
+import sys
 import unittest
 
 SPEC = importlib.util.spec_from_file_location(
@@ -217,6 +218,139 @@ class TestEpub(unittest.TestCase):
         blocks = processor.sort_chapter_blocks(processor.split_chapters_by_pattern(text, pattern))
         chapters = [("前言", b) if t is None else (t, b) for t, b in blocks if b.strip()]
         self.assertEqual([t for t, _ in chapters], ["第一章 甲", "第二章 乙", "第十二章 转折"])
+
+
+class TestEpubCover(unittest.TestCase):
+    def test_cover_and_author(self):
+        import tempfile, zipfile
+        cover_bytes = b"\x89PNG\r\n\x1a\n" + b"\x00" * 16  # 假 PNG 字节
+        chapters = [("第一章 起点", "内容")]
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "带封面.epub")
+            processor.build_epub(path, "书名", chapters,
+                                 author="作者甲", cover=cover_bytes, cover_ext=".png")
+            with zipfile.ZipFile(path) as z:
+                names = z.namelist()
+                self.assertIn("OEBPS/cover.png", names)
+                self.assertIn("OEBPS/cover.xhtml", names)
+                self.assertEqual(z.read("OEBPS/cover.png"), cover_bytes)
+                opf = z.read("OEBPS/content.opf").decode("utf-8")
+                self.assertIn('<dc:creator>作者甲</dc:creator>', opf)
+                self.assertIn('properties="cover-image"', opf)
+                self.assertIn('<meta name="cover" content="cover-image"/>', opf)
+                # 封面页在 spine 首位
+                spine = opf.split("<spine")[1]
+                self.assertLess(spine.index('idref="cover-page"'), spine.index('idref="ch1"'))
+
+    def test_no_cover_no_creator(self):
+        import tempfile, zipfile
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "无封面.epub")
+            processor.build_epub(path, "书名", [("章", "文")])
+            with zipfile.ZipFile(path) as z:
+                names = z.namelist()
+                self.assertNotIn("OEBPS/cover.png", names)
+                opf = z.read("OEBPS/content.opf").decode("utf-8")
+                self.assertNotIn("dc:creator", opf)
+                self.assertNotIn("cover-image", opf)
+
+
+class TestCli(unittest.TestCase):
+    """命令行模式端到端测试（子进程运行）"""
+
+    SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..",
+                          "全能TXT文本处理器.py")
+    NOVEL = ("本书由某某整理\n"
+             "第一章 甲\n内容甲第一段。\n内容甲第二段。\n"
+             "第十二章 转折\n内容十二。\n"
+             "第二章 乙\n内容乙。\n"
+             "第一章 甲\n内容甲第一段。\n内容甲第二段。\n")  # 第四章与第一章完全重复（乱序+重复）
+
+    def _run(self, *cli_args):
+        import subprocess
+        return subprocess.run(
+            [sys.executable, self.SCRIPT, *cli_args],
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=60)
+
+    def _make_novel(self, d, name="小说.txt"):
+        path = os.path.join(d, name)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(self.NOVEL)
+        return path
+
+    def test_dedup_stdout_and_inplace(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            path = self._make_novel(d)
+            r = self._run("dedup", path, "--encoding", "utf-8")
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertIn("第十二章", r.stdout)
+            # 完全重复的"第一章 甲"正文块只出现一次
+            self.assertEqual(r.stdout.count("内容甲第二段。"), 1)
+            # 原文件未被修改
+            self.assertIn("第一章 甲\n内容甲第一段", open(path, encoding="utf-8").read())
+
+            r2 = self._run("dedup", path, "--in-place", "--encoding", "utf-8")
+            self.assertEqual(r2.returncode, 0, r2.stderr)
+            self.assertIn("剔除", r2.stdout)
+            self.assertTrue(os.path.exists(path + ".bak"))
+            self.assertEqual(open(path, encoding="utf-8").read().count("第一章 甲"), 1)
+
+    def test_sort_inplace(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            path = self._make_novel(d)
+            r = self._run("sort", path, "--in-place", "--encoding", "utf-8")
+            self.assertEqual(r.returncode, 0, r.stderr)
+            text = open(path, encoding="utf-8").read()
+            self.assertLess(text.index("第一章 甲"), text.index("第二章 乙"))
+            self.assertLess(text.index("第二章 乙"), text.index("第十二章"))
+
+    def test_split_outdir(self):
+        import tempfile, os as osmod
+        with tempfile.TemporaryDirectory() as d:
+            path = self._make_novel(d)
+            outdir = os.path.join(d, "out")
+            r = self._run("split", path, "--outdir", outdir, "--encoding", "utf-8")
+            self.assertEqual(r.returncode, 0, r.stderr)
+            files = sorted(osmod.listdir(outdir))
+            self.assertIn("章节索引.txt", files)
+            self.assertTrue(any("第一章" in f for f in files))
+
+    def test_epub_export(self):
+        import tempfile, zipfile
+        with tempfile.TemporaryDirectory() as d:
+            path = self._make_novel(d)
+            out = os.path.join(d, "书.epub")
+            r = self._run("epub", path, "--out", out, "--title", "测试书",
+                          "--author", "作者乙", "--encoding", "utf-8")
+            self.assertEqual(r.returncode, 0, r.stderr)
+            with zipfile.ZipFile(out) as z:
+                opf = z.read("OEBPS/content.opf").decode("utf-8")
+                self.assertIn("<dc:title>测试书</dc:title>", opf)
+                self.assertIn("<dc:creator>作者乙</dc:creator>", opf)
+
+    def test_adfilter_and_convert(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            path = self._make_novel(d)
+            words = os.path.join(d, "words.txt")
+            with open(words, "w", encoding="utf-8") as f:
+                f.write("内容乙\n")
+            r = self._run("adfilter", path, "--words-file", words,
+                          "--in-place", "--encoding", "utf-8")
+            self.assertEqual(r.returncode, 0, r.stderr)
+            # 含"内容乙"的行已被删除
+            self.assertNotIn("内容乙", open(path, encoding="utf-8").read())
+
+            outdir = os.path.join(d, "converted")
+            r2 = self._run("convert", path, "--to", "gbk", "--outdir", outdir)
+            self.assertEqual(r2.returncode, 0, r2.stderr)
+            gbk_file = os.path.join(outdir, os.path.basename(path))
+            with open(gbk_file, "rb") as f:
+                raw = f.read()
+            self.assertNotIn(b"\xef\xbb\xbf", raw)  # utf-8 BOM 应已去除
+            raw.decode("gbk")  # 能按 GBK 解码
 
 
 if __name__ == "__main__":

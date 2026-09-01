@@ -42,10 +42,19 @@
  21. 新增 章节重排：按标题编号（中文/阿拉伯数字）升序整理乱序章节，开头内容保持最前
  22. 查找替换新增"标记全部"：预览区一次性高亮所有匹配项
 
+2.5 新增：
+ 23. EPUB 导出支持 封面图（jpg/png/gif）与 作者名（作者名随设置记忆）
+ 24. 新增 命令行模式（不启动界面），便于脚本化批量处理：
+     split / epub / dedup / sort / adfilter / convert 子命令；
+     不带参数运行仍是图形界面。示例：
+     python 全能TXT文本处理器.py epub 小说.txt --out 小说.epub --author 某某 --cover cover.jpg
+     python 全能TXT文本处理器.py dedup 小说.txt --in-place
+
 所有处理仅修改内存，需手动"保存到原文件"或"另存为新文件"才会写盘。
 运行依赖：tkinterdnd2（可选，pip install tkinterdnd2，用于拖放）
 """
 
+import argparse
 import difflib
 import html
 import json
@@ -67,7 +76,7 @@ except ImportError:
     DND_AVAILABLE = False
 
 # 默认窗口标题
-DEFAULT_TITLE = "全能TXT文本处理器 2.4"
+DEFAULT_TITLE = "全能TXT文本处理器 2.5"
 
 # ------------------------------ 界面主题配色（扁平化浅色主题） ------------------------------
 COLOR_BG        = "#EEF1F5"   # 页面背景
@@ -162,6 +171,13 @@ def dedup_chapter_blocks(blocks, similarity_threshold=0.9):
         title_bodies[key] = norm_body
         kept.append((title, body))
     return kept, removed
+
+
+def rebuild_text_from_blocks(blocks):
+    """把章节块重新拼接为文本（章节间空行分隔，标题独立成行）"""
+    return "\n\n".join(
+        f"{t}\n\n{b.strip()}" if t is not None else b.strip()
+        for t, b in blocks if b.strip())
 
 
 def filter_ad_lines(text, keywords, whole_line=False):
@@ -288,8 +304,13 @@ _EPUB_CSS = (
 )
 
 
-def build_epub(epub_path, book_title, chapters):
-    """把章节列表打包为 EPUB3 电子书。chapters: [(标题, 正文纯文本)]。零依赖。"""
+_COVER_MEDIA_TYPES = {".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+                      ".png": "image/png", ".gif": "image/gif"}
+
+
+def build_epub(epub_path, book_title, chapters, author="", cover=None, cover_ext=".jpg"):
+    """把章节列表打包为 EPUB3 电子书。chapters: [(标题, 正文纯文本)]。
+    author: 作者名（可空）；cover: 封面图片字节（可空），cover_ext 决定图片类型。零依赖。"""
     book_uuid = uuid.uuid4()
     modified = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
@@ -303,6 +324,17 @@ def build_epub(epub_path, book_title, chapters):
     )
 
     manifest_items, spine_items, nav_lis, ncx_points = [], [], [], []
+    cover_media = _COVER_MEDIA_TYPES.get(cover_ext.lower())
+    if cover and cover_media:
+        cover_fname = "cover" + cover_ext.lower()
+        manifest_items.append(
+            f'<item id="cover-image" href="{cover_fname}" media-type="{cover_media}" '
+            'properties="cover-image"/>')
+        manifest_items.append(
+            '<item id="cover-page" href="cover.xhtml" media-type="application/xhtml+xml"/>')
+        # 封面页放在 spine 首位
+        spine_items.append('<itemref idref="cover-page" linear="yes"/>')
+
     for i, (title, _body) in enumerate(chapters, 1):
         fname = f"chapter_{i:03d}.xhtml"
         esc_title = html.escape(title)
@@ -314,14 +346,20 @@ def build_epub(epub_path, book_title, chapters):
             f'<navPoint id="np{i}" playOrder="{i}"><navLabel><text>{esc_title}</text></navLabel>'
             f'<content src="{fname}"/></navPoint>')
 
+    creator_line = f"    <dc:creator>{html.escape(author)}</dc:creator>\n" if author else ""
+    cover_image_meta = ('    <meta name="cover" content="cover-image"/>\n'
+                        if cover and cover_media else "")
+
     content_opf = (
         '<?xml version="1.0" encoding="UTF-8"?>\n'
         '<package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="bookid">\n'
         '  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">\n'
         f"    <dc:identifier id=\"bookid\">urn:uuid:{book_uuid}</dc:identifier>\n"
         f"    <dc:title>{html.escape(book_title)}</dc:title>\n"
+        + creator_line +
         "    <dc:language>zh</dc:language>\n"
         f"    <meta property=\"dcterms:modified\">{modified}</meta>\n"
+        + cover_image_meta +
         "  </metadata>\n"
         "  <manifest>\n"
         '    <item id="nav" href="nav.xhtml" media-type="application/xhtml+xml" properties="nav"/>\n'
@@ -364,9 +402,62 @@ def build_epub(epub_path, book_title, chapters):
         z.writestr("OEBPS/style.css", _EPUB_CSS, zipfile.ZIP_DEFLATED)
         z.writestr("OEBPS/nav.xhtml", nav_xhtml, zipfile.ZIP_DEFLATED)
         z.writestr("OEBPS/toc.ncx", toc_ncx, zipfile.ZIP_DEFLATED)
+        if cover and cover_media:
+            cover_page = (
+                '<?xml version="1.0" encoding="utf-8"?>\n'
+                "<!DOCTYPE html>\n"
+                '<html xmlns="http://www.w3.org/1999/xhtml" xml:lang="zh">\n'
+                "<head><title>封面</title>"
+                "<style>body{margin:0;padding:0;text-align:center}"
+                "img{max-width:100%;height:auto}</style></head>\n"
+                f'<body><img src="cover{cover_ext.lower()}" alt="cover"/></body>\n</html>'
+            )
+            z.writestr("OEBPS/cover.xhtml", cover_page, zipfile.ZIP_DEFLATED)
+            z.writestr("OEBPS/cover" + cover_ext.lower(), cover)
         for i, (title, body) in enumerate(chapters, 1):
             z.writestr(f"OEBPS/chapter_{i:03d}.xhtml",
                        chapter_xhtml(title, body), zipfile.ZIP_DEFLATED)
+
+
+def system_ansi():
+    """当前系统的 ANSI 编码名（Windows 为 mbcs）"""
+    return "mbcs" if sys.platform.startswith("win") else "cp1252"
+
+
+def display_to_codec(display):
+    """界面编码显示名 -> 实际 Python 编码名（修复 ansi 不合法的问题）"""
+    return system_ansi() if display == "ansi" else display
+
+
+def read_text_smart(path, chosen_display):
+    """按选定编码读取文件，失败时自动尝试常见备选编码。
+    返回 (内容, 实际使用的编码名)，写回时按此编码保存以保持原样。"""
+    chosen = display_to_codec(chosen_display)
+    if chosen in ("utf-8", "utf-8-sig"):
+        # utf-8-sig 可同时正确读取带/不带 BOM 的 UTF-8 文件
+        candidates = ["utf-8-sig", "gbk", "utf-16", system_ansi()]
+    else:
+        candidates = [chosen, "utf-8-sig", "gbk", "utf-16", system_ansi()]
+    # 去重，保持顺序
+    seen = set()
+    candidates = [c for c in candidates if not (c in seen or seen.add(c))]
+
+    last_err = None
+    for enc in candidates:
+        try:
+            with open(path, "r", encoding=enc) as f:
+                content = f.read()
+            # UTF-8 文件：根据是否有 BOM 决定记录的编码，写回时保持原样
+            if enc in ("utf-8", "utf-8-sig"):
+                with open(path, "rb") as bf:
+                    has_bom = bf.read(3) == b"\xef\xbb\xbf"
+                enc = "utf-8-sig" if has_bom else "utf-8"
+            return content, enc
+        except (UnicodeDecodeError, UnicodeError) as e:
+            last_err = e
+        except LookupError:
+            continue  # 当前平台不支持的编码，尝试下一个
+    raise last_err if last_err else OSError("无法识别文件编码")
 
 
 class TextProcessorApp:
@@ -395,6 +486,7 @@ class TextProcessorApp:
         self.last_find_pos = 0         # 查找位置（字符偏移量）
         self.ad_filter_words = []      # 广告过滤关键词列表（持久化）
         self.ad_whole_line = False     # 广告过滤：整行完全匹配才删除
+        self.epub_author = ""          # EPUB 导出作者名（持久化）
         self.newline_var = tk.StringVar(value="默认")  # 保存时的换行符模式
 
         # 界面控件注册
@@ -577,43 +669,14 @@ class TextProcessorApp:
 
     @staticmethod
     def _system_ansi():
-        """当前系统的 ANSI 编码名（Windows 为 mbcs）"""
-        return "mbcs" if sys.platform.startswith("win") else "cp1252"
+        return system_ansi()
 
     @classmethod
     def _display_to_codec(cls, display):
-        """界面编码显示名 -> 实际 Python 编码名（修复 ansi 不合法的问题）"""
-        return cls._system_ansi() if display == "ansi" else display
+        return display_to_codec(display)
 
     def _read_text(self, path, chosen_display):
-        """按选定编码读取文件，失败时自动尝试常见备选编码。
-        返回 (内容, 实际使用的编码名)，写回时按此编码保存以保持原样。"""
-        chosen = self._display_to_codec(chosen_display)
-        if chosen in ("utf-8", "utf-8-sig"):
-            # utf-8-sig 可同时正确读取带/不带 BOM 的 UTF-8 文件
-            candidates = ["utf-8-sig", "gbk", "utf-16", self._system_ansi()]
-        else:
-            candidates = [chosen, "utf-8-sig", "gbk", "utf-16", self._system_ansi()]
-        # 去重，保持顺序
-        seen = set()
-        candidates = [c for c in candidates if not (c in seen or seen.add(c))]
-
-        last_err = None
-        for enc in candidates:
-            try:
-                with open(path, "r", encoding=enc) as f:
-                    content = f.read()
-                # UTF-8 文件：根据是否有 BOM 决定记录的编码，写回时保持原样
-                if enc in ("utf-8", "utf-8-sig"):
-                    with open(path, "rb") as bf:
-                        has_bom = bf.read(3) == b"\xef\xbb\xbf"
-                    enc = "utf-8-sig" if has_bom else "utf-8"
-                return content, enc
-            except (UnicodeDecodeError, UnicodeError) as e:
-                last_err = e
-            except LookupError:
-                continue  # 当前平台不支持的编码，尝试下一个
-        raise last_err if last_err else OSError("无法识别文件编码")
+        return read_text_smart(path, chosen_display)
 
     # ------------------------------ 设置持久化 ------------------------------
     @property
@@ -646,9 +709,10 @@ class TextProcessorApp:
         if isinstance(words, list):
             self.ad_filter_words = [str(w) for w in words if str(w).strip()]
         self.ad_whole_line = bool(settings.get("ad_whole_line", False))
+        self.epub_author = str(settings.get("epub_author", ""))
 
     def save_settings(self):
-        """保存设置（编码、窗口大小、换行符、广告过滤词）"""
+        """保存设置（编码、窗口大小、换行符、广告过滤词、EPUB 作者名）"""
         try:
             with open(self._settings_path, "w", encoding="utf-8") as f:
                 json.dump({
@@ -657,6 +721,7 @@ class TextProcessorApp:
                     "newline_mode": self.newline_var.get(),
                     "ad_filter_words": self.ad_filter_words,
                     "ad_whole_line": self.ad_whole_line,
+                    "epub_author": self.epub_author,
                 }, f, ensure_ascii=False, indent=2)
         except Exception:
             pass
@@ -681,7 +746,7 @@ class TextProcessorApp:
         header_inner.pack(fill=tk.X, padx=14, pady=8)
         tk.Label(header_inner, text="全能TXT文本处理器", bg=COLOR_PRIMARY, fg="#FFFFFF",
                  font=(face, 15, "bold")).pack(side=tk.LEFT)
-        tk.Label(header_inner, text="v2.4 · 仅修改内存 · 手动保存", bg=COLOR_PRIMARY,
+        tk.Label(header_inner, text="v2.5 · 仅修改内存 · 手动保存", bg=COLOR_PRIMARY,
                  fg="#BFDBFE", font=(face, 9)).pack(side=tk.LEFT, padx=(10, 0), pady=(4, 0))
         self.busy_label = tk.Label(header_inner, text="", bg=COLOR_PRIMARY, fg="#FDE68A",
                                    font=(face, 10, "bold"))
@@ -1581,10 +1646,84 @@ class TextProcessorApp:
         target_files = self._select_target_files("导出EPUB")
         if not target_files:
             return
-        save_dir = filedialog.askdirectory(title="选择 EPUB 保存目录")
-        if not save_dir:
-            return
+        self._show_epub_export_dialog(target_files)
 
+    def _show_epub_export_dialog(self, target_files):
+        """EPUB 导出设置：作者名与封面图（作者名随设置持久化）"""
+        win = tk.Toplevel(self.root)
+        win.title("导出 EPUB")
+        win.geometry("540x260")
+        win.configure(bg=COLOR_CARD)
+        win.transient(self.root)
+
+        form = ttk.LabelFrame(win, text="书籍信息（对本次导出的所有文件生效）",
+                              style="Card.TLabelframe")
+        form.pack(fill=tk.X, padx=10, pady=(10, 6))
+
+        author_row = ttk.Frame(form)
+        author_row.pack(fill=tk.X, padx=6, pady=4)
+        ttk.Label(author_row, text="作者名", width=8).pack(side=tk.LEFT)
+        author_var = tk.StringVar(value=self.epub_author)
+        ttk.Entry(author_row, textvariable=author_var, width=28).pack(side=tk.LEFT, padx=3)
+
+        cover_row = ttk.Frame(form)
+        cover_row.pack(fill=tk.X, padx=6, pady=4)
+        ttk.Label(cover_row, text="封面图", width=8).pack(side=tk.LEFT)
+        cover_var = tk.StringVar(value="")
+        cover_label = ttk.Label(cover_row, text="（未选择，可选 jpg/png/gif）",
+                                style="Muted.TLabel")
+
+        def choose_cover():
+            path = filedialog.askopenfilename(
+                title="选择封面图片",
+                filetypes=[("图片", "*.jpg *.jpeg *.png *.gif"), ("所有文件", "*.*")],
+                parent=win)
+            if path:
+                cover_var.set(path)
+                cover_label.configure(text=os.path.basename(path))
+
+        def clear_cover():
+            cover_var.set("")
+            cover_label.configure(text="（未选择，可选 jpg/png/gif）")
+
+        ttk.Button(cover_row, text="选择图片...", command=choose_cover).pack(side=tk.LEFT, padx=3)
+        ttk.Button(cover_row, text="清除", command=clear_cover).pack(side=tk.LEFT, padx=3)
+        cover_label.pack(side=tk.LEFT, padx=3)
+
+        ttk.Label(win, text="将按章节规则自动分章，每个文件生成一本 .epub 到所选目录。",
+                  style="Muted.TLabel").pack(anchor=tk.W, padx=10, pady=4)
+
+        def confirm():
+            author = author_var.get().strip()
+            cover_bytes, cover_ext = None, ".jpg"
+            cover_path = cover_var.get()
+            if cover_path:
+                ext = os.path.splitext(cover_path)[1].lower()
+                if ext not in _COVER_MEDIA_TYPES:
+                    messagebox.showerror("错误", "封面仅支持 jpg / png / gif", parent=win)
+                    return
+                try:
+                    with open(cover_path, "rb") as f:
+                        cover_bytes = f.read()
+                    cover_ext = ext
+                except Exception as e:
+                    messagebox.showerror("错误", f"读取封面失败：{e}", parent=win)
+                    return
+            self.epub_author = author
+            self.save_settings()
+            win.destroy()
+            save_dir = filedialog.askdirectory(title="选择 EPUB 保存目录")
+            if not save_dir:
+                return
+            self._run_epub_export(target_files, author, cover_bytes, cover_ext, save_dir)
+
+        btn_bar = ttk.Frame(win, style="Page.TFrame")
+        btn_bar.pack(fill=tk.X, padx=10, pady=(0, 10))
+        ttk.Button(btn_bar, text="开始导出", command=confirm, style="Primary.TButton").pack(side=tk.LEFT, padx=3)
+        ttk.Button(btn_bar, text="取消", command=win.destroy).pack(side=tk.RIGHT, padx=3)
+
+    def _run_epub_export(self, target_files, author, cover_bytes, cover_ext, save_dir):
+        """后台执行 EPUB 导出"""
         def worker():
             q = self.task_queue
             exported = 0
@@ -1602,7 +1741,8 @@ class TextProcessorApp:
                         q.put(("error", f"{os.path.basename(file_path)}：内容为空，已跳过"))
                         continue
                     epub_path = os.path.join(save_dir, f"{stem}.epub")
-                    build_epub(epub_path, stem, chapters)
+                    build_epub(epub_path, stem, chapters, author=author,
+                               cover=cover_bytes, cover_ext=cover_ext)
                     exported += 1
                 except Exception as e:
                     q.put(("error", f"{os.path.basename(file_path)}：{str(e)}"))
@@ -1968,10 +2108,7 @@ class TextProcessorApp:
                         continue
                     kept, removed = dedup_chapter_blocks(blocks)
                     if removed:
-                        rebuilt = "\n\n".join(
-                            f"{t}\n\n{b.strip()}" if t is not None else b.strip()
-                            for t, b in kept if b.strip())
-                        self.file_contents[file_path] = rebuilt
+                        self.file_contents[file_path] = rebuild_text_from_blocks(kept)
                         total_removed += len(removed)
                         files_hit += 1
                         summary.append(f"{os.path.basename(file_path)}：剔除 {len(removed)} 章，如 {removed[0]}")
@@ -2011,10 +2148,7 @@ class TextProcessorApp:
                         continue
                     ordered = sort_chapter_blocks(blocks)
                     if ordered != blocks:
-                        rebuilt = "\n\n".join(
-                            f"{t}\n\n{b.strip()}" if t is not None else b.strip()
-                            for t, b in ordered if b.strip())
-                        self.file_contents[file_path] = rebuilt
+                        self.file_contents[file_path] = rebuild_text_from_blocks(ordered)
                         sorted_files += 1
                 except Exception as e:
                     q.put(("error", f"{os.path.basename(file_path)}：{str(e)}"))
@@ -2451,8 +2585,248 @@ class TextProcessorApp:
         self.status_var.set("查找替换区域已清空")
 
 
+# ------------------------------ 命令行模式 ------------------------------
+# 不启动界面，便于脚本化批量处理；不带参数运行仍是图形界面
+_CLI_COMMANDS = {"split", "epub", "dedup", "sort", "adfilter", "convert"}
+
+
+def _cli_inplace_write(path, content, encode):
+    """覆盖写回原文件（首次自动按字节生成 .bak 备份）"""
+    backup = path + ".bak"
+    if not os.path.exists(backup):
+        with open(path, "rb") as src, open(backup, "wb") as dst:
+            dst.write(src.read())
+    with open(path, "w", encoding=encode, newline="") as f:
+        f.write(content)
+
+
+def _cli_split_content(content, preset, custom):
+    """CLI 按规则名或自定义正则得到章节块"""
+    if custom:
+        pattern = re.compile(custom)
+    else:
+        pattern = re.compile(_CHAPTER_PRESETS[preset])
+    return split_chapters_by_pattern(content, pattern)
+
+
+def _cli_cmd_split(args):
+    total = 0
+    for path in args.files:
+        content, enc = read_text_smart(path, args.encoding)
+        stem = os.path.splitext(os.path.basename(path))[0]
+        outdir = args.outdir or (stem + "_章节")
+        os.makedirs(outdir, exist_ok=True)
+        blocks = _cli_split_content(content, args.preset, args.pattern)
+        if not any(t is not None for t, _ in blocks):
+            print(f"[跳过] {path}：未识别到章节标题", file=sys.stderr)
+            continue
+        entries = []
+        seq = 0
+        for title, body in blocks:
+            text = body.strip()
+            if title is None:
+                if not text:
+                    continue
+                fname = f"{stem}_00_开头.txt"
+                write_text = text
+            else:
+                seq += 1
+                safe_title = re.sub(r'[\\/:*?"<>|\s]+', "_", title)
+                fname = f"{stem}_{seq:03d}_{safe_title}.txt"
+                write_text = f"{title}\n\n{text}"
+            with open(os.path.join(outdir, fname), "w", encoding=enc, newline="") as f:
+                f.write(write_text)
+            entries.append(f"{fname}  （{len(text)} 字）")
+            total += 1
+        with open(os.path.join(outdir, "章节索引.txt"), "w", encoding=enc, newline="") as f:
+            f.write(f"《{stem}》共 {len(entries)} 个文件\n\n" + "\n".join(entries))
+        print(f"[完成] {path} -> {outdir}/（{len(entries)} 个文件 + 章节索引）")
+    print(f"共分割出 {total} 个章节文件")
+    return 0
+
+
+def _cli_cmd_epub(args):
+    content, _ = read_text_smart(args.file, args.encoding)
+    stem = os.path.splitext(os.path.basename(args.file))[0]
+    blocks = _cli_split_content(content, args.preset, args.pattern)
+    chapters = [("前言", b) if t is None else (t, b) for t, b in blocks if b.strip()]
+    if not chapters:
+        print("错误：内容为空", file=sys.stderr)
+        return 1
+    cover_bytes, cover_ext = None, ".jpg"
+    if args.cover:
+        ext = os.path.splitext(args.cover)[1].lower()
+        if ext not in _COVER_MEDIA_TYPES:
+            print("错误：封面仅支持 jpg / png / gif", file=sys.stderr)
+            return 1
+        with open(args.cover, "rb") as f:
+            cover_bytes = f.read()
+        cover_ext = ext
+    build_epub(args.out, args.title or stem, chapters, author=args.author,
+               cover=cover_bytes, cover_ext=cover_ext)
+    print(f"已导出 EPUB：{args.out}（{len(chapters)} 章）")
+    return 0
+
+
+def _cli_cmd_dedup(args):
+    pattern = re.compile(_CHAPTER_PRESETS["第X章+序章/楔子/番外"])
+    for path in args.files:
+        content, enc = read_text_smart(path, args.encoding)
+        blocks = split_chapters_by_pattern(content, pattern)
+        if sum(1 for t, _ in blocks if t is not None) < 2:
+            print(f"[跳过] {path}：未识别到章节（或仅一章）", file=sys.stderr)
+            continue
+        kept, removed = dedup_chapter_blocks(blocks)
+        if not removed:
+            print(f"[无变化] {path}：未发现重复章节", file=sys.stderr)
+            continue
+        new_content = rebuild_text_from_blocks(kept)
+        if args.in_place:
+            _cli_inplace_write(path, new_content, enc)
+            print(f"[完成] {path}：剔除 {len(removed)} 章（已写回，原文件备份为 .bak）")
+        else:
+            print(new_content)
+    return 0
+
+
+def _cli_cmd_sort(args):
+    pattern = re.compile(_CHAPTER_PRESETS["第X章+序章/楔子/番外"])
+    for path in args.files:
+        content, enc = read_text_smart(path, args.encoding)
+        blocks = split_chapters_by_pattern(content, pattern)
+        if sum(1 for t, _ in blocks if t is not None) < 2:
+            print(f"[跳过] {path}：未识别到章节（或仅一章）", file=sys.stderr)
+            continue
+        ordered = sort_chapter_blocks(blocks)
+        if ordered == blocks:
+            print(f"[无变化] {path}：章节顺序已正确", file=sys.stderr)
+            continue
+        new_content = rebuild_text_from_blocks(ordered)
+        if args.in_place:
+            _cli_inplace_write(path, new_content, enc)
+            print(f"[完成] {path}：章节已按编号重排（已写回，原文件备份为 .bak）")
+        else:
+            print(new_content)
+    return 0
+
+
+def _cli_cmd_adfilter(args):
+    words_content, _ = read_text_smart(args.words_file, "utf-8")
+    keywords = sorted({w.strip() for w in words_content.splitlines() if w.strip()})
+    if not keywords:
+        print("错误：关键词文件为空", file=sys.stderr)
+        return 1
+    for path in args.files:
+        content, enc = read_text_smart(path, args.encoding)
+        new_content, removed = filter_ad_lines(content, keywords, args.whole_line)
+        if not removed:
+            print(f"[无变化] {path}：未命中任何关键词", file=sys.stderr)
+            continue
+        if args.in_place:
+            _cli_inplace_write(path, new_content, enc)
+            print(f"[完成] {path}：删除 {removed} 行（已写回，原文件备份为 .bak）")
+        else:
+            print(new_content)
+    return 0
+
+
+def _cli_cmd_convert(args):
+    for path in args.files:
+        content, src_enc = read_text_smart(path, "utf-8")  # 源编码智能探测
+        target = display_to_codec(args.to)
+        if args.in_place:
+            _cli_inplace_write(path, content, target)
+        else:
+            outdir = args.outdir or "."
+            os.makedirs(outdir, exist_ok=True)
+            out_path = os.path.join(outdir, os.path.basename(path))
+            with open(out_path, "w", encoding=target, newline="") as f:
+                f.write(content)
+        print(f"[完成] {path}：{src_enc} -> {args.to}")
+    return 0
+
+
+def build_cli_parser():
+    parser = argparse.ArgumentParser(
+        prog="全能TXT文本处理器",
+        description="命令行批量处理模式（不带参数运行则启动图形界面）")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    p = sub.add_parser("split", help="按章节标题分割为独立文件 + 章节索引")
+    p.add_argument("files", nargs="+", help="TXT 文件")
+    p.add_argument("--preset", default="第X章+序章/楔子/番外",
+                   choices=list(_CHAPTER_PRESETS), help="内置章节规则（默认：第X章+序章/楔子/番外）")
+    p.add_argument("--pattern", default=None, help="自定义章节标题正则（优先于 --preset）")
+    p.add_argument("--outdir", default=None, help="输出目录（默认：<文件名>_章节/）")
+    p.add_argument("--encoding", default="utf-8", help="读取编码（默认 utf-8，自动探测兜底）")
+    p.set_defaults(func=_cli_cmd_split)
+
+    p = sub.add_parser("epub", help="导出 EPUB3 电子书")
+    p.add_argument("file", help="TXT 文件")
+    p.add_argument("--out", required=True, help="输出的 .epub 路径")
+    p.add_argument("--title", default=None, help="书名（默认用文件名）")
+    p.add_argument("--author", default="", help="作者名")
+    p.add_argument("--cover", default=None, help="封面图片（jpg/png/gif）")
+    p.add_argument("--preset", default="第X章+序章/楔子/番外",
+                   choices=list(_CHAPTER_PRESETS), help="内置章节规则")
+    p.add_argument("--pattern", default=None, help="自定义章节标题正则（优先于 --preset）")
+    p.add_argument("--encoding", default="utf-8")
+    p.set_defaults(func=_cli_cmd_epub)
+
+    p = sub.add_parser("dedup", help="章节去重（默认输出到 stdout，--in-place 写回）")
+    p.add_argument("files", nargs="+")
+    p.add_argument("--in-place", action="store_true", help="覆盖原文件（自动 .bak 备份）")
+    p.add_argument("--encoding", default="utf-8")
+    p.set_defaults(func=_cli_cmd_dedup)
+
+    p = sub.add_parser("sort", help="章节按编号重排（默认输出到 stdout，--in-place 写回）")
+    p.add_argument("files", nargs="+")
+    p.add_argument("--in-place", action="store_true")
+    p.add_argument("--encoding", default="utf-8")
+    p.set_defaults(func=_cli_cmd_sort)
+
+    p = sub.add_parser("adfilter", help="删除包含关键词的行（默认输出到 stdout，--in-place 写回）")
+    p.add_argument("files", nargs="+")
+    p.add_argument("--words-file", required=True, help="关键词文件（每行一个，UTF-8）")
+    p.add_argument("--whole-line", action="store_true", help="整行完全匹配才删除")
+    p.add_argument("--in-place", action="store_true")
+    p.add_argument("--encoding", default="utf-8")
+    p.set_defaults(func=_cli_cmd_adfilter)
+
+    p = sub.add_parser("convert", help="编码转换（源编码自动探测）")
+    p.add_argument("files", nargs="+")
+    p.add_argument("--to", default="utf-8",
+                   choices=["utf-8", "gbk", "gb2312", "utf-16", "ansi"], help="目标编码")
+    p.add_argument("--outdir", default=None, help="输出目录（缺省当前目录；--in-place 时忽略）")
+    p.add_argument("--in-place", action="store_true", help="覆盖原文件（自动 .bak 备份）")
+    p.set_defaults(func=_cli_cmd_convert)
+
+    return parser
+
+
+def cli_main(argv=None):
+    """命令行入口。返回退出码。"""
+    args = build_cli_parser().parse_args(argv)
+    # 控制台输出容错：GBK 控制台遇到生僻字不崩
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+    try:
+        return args.func(args)
+    except BrokenPipeError:
+        return 0
+    except Exception as e:
+        print(f"错误：{e}", file=sys.stderr)
+        return 1
+
+
 # ------------------------------ 程序入口 ------------------------------
 if __name__ == "__main__":
+    # 带子命令或任意选项参数（如 --help）进入命令行模式；不带参数启动图形界面
+    if len(sys.argv) > 1 and (sys.argv[1] in _CLI_COMMANDS or sys.argv[1].startswith("-")):
+        sys.exit(cli_main())
     if DND_AVAILABLE:
         root = TkinterDnD.Tk()
     else:

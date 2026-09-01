@@ -17,7 +17,7 @@
 - **分割章节**：内置多种章节标题规则（第X章 / 卷/回/节/集/篇、序章/楔子/番外、Chapter X），
   也支持自定义正则；分割前可**预览章节列表与字数**，分割后自动生成**章节索引.txt**
 - **导出 EPUB**：按章节规则自动分章，一键打包为 EPUB3 电子书（纯标准库实现，零依赖，
-  带目录导航，手机阅读器可直接打开）
+  带目录导航，手机阅读器可直接打开），支持**封面图**（jpg/png/gif）与**作者名**
 
 ### 文本处理（批量，仅修改内存）
 - 查找替换：支持正则、全字匹配、批量替换所有文件、**标记全部匹配项**
@@ -73,6 +73,33 @@ python 全能TXT文本处理器.py
 pip install pyinstaller tkinterdnd2
 scripts\build_exe.bat   # 或双击运行，输出位于 dist/
 ```
+
+## 命令行模式（v2.5 新增）
+
+不启动界面，适合脚本化批量处理；不带参数运行仍是图形界面。exe 同样支持（`PaperWorker-*.exe <命令> ...`）。
+
+```bash
+# 按章节分割为独立文件（输出到 小说_章节/ 目录，含章节索引）
+python 全能TXT文本处理器.py split 小说.txt
+
+# 导出 EPUB（自动分章、封面、作者名）
+python 全能TXT文本处理器.py epub 小说.txt --out 小说.epub --author 某某 --cover cover.jpg
+
+# 章节去重 / 重排（默认结果输出到 stdout，加 --in-place 覆盖原文件，自动 .bak 备份）
+python 全能TXT文本处理器.py dedup 小说.txt --in-place
+python 全能TXT文本处理器.py sort 小说.txt --in-place
+
+# 广告行过滤（关键词文件每行一个）
+python 全能TXT文本处理器.py adfilter 小说.txt --words-file 广告词.txt --in-place
+
+# 编码转换（源编码自动探测）
+python 全能TXT文本处理器.py convert *.txt --to utf-8 --outdir 转码后/
+
+# 全部子命令支持 --pattern 自定义章节正则、--encoding 指定读取编码
+python 全能TXT文本处理器.py --help
+```
+
+各命令的 dedup/sort/adfilter 串联使用即可组成完整的"盗版小说清洗 → 分章 → EPUB"流水线。
 
 ## 项目结构
 
