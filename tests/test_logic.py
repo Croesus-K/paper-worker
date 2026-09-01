@@ -370,6 +370,26 @@ class TestCli(unittest.TestCase):
             html_text = open(out, encoding="utf-8").read()
             self.assertIn("<svg", html_text)
 
+    def test_cli_sensitive(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            novel = os.path.join(d, "小说.txt")
+            with open(novel, "w", encoding="utf-8") as f:
+                f.write("开头一行。\n这里出现违禁词。\n干净的一行。\n违禁词又出现了。\n")
+            words = os.path.join(d, "词表.txt")
+            with open(words, "w", encoding="utf-8") as f:
+                f.write("违禁词\n不该出现的词\n")
+            r = self._run("sensitive", novel, "--words-file", words)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertIn("【违禁词】2 处", r.stdout)
+            self.assertIn("第 2、4 行", r.stdout)
+            self.assertIn("未命中：不该出现的词", r.stdout)
+
+            out = os.path.join(d, "报告.txt")
+            r2 = self._run("sensitive", novel, "--words-file", words, "--out", out)
+            self.assertEqual(r2.returncode, 0, r2.stderr)
+            self.assertIn("违禁词", open(out, encoding="utf-8").read())
+
     def test_cli_hex_and_diff(self):
         import tempfile
         with tempfile.TemporaryDirectory() as d:
@@ -636,6 +656,41 @@ class TestAuthor(unittest.TestCase):
         # 人名全程未出现时不出曲线区块
         report2 = processor.build_text_report(text, "书", pattern, names=["路人丙"])
         self.assertNotIn("人物出场曲线", report2)
+
+
+class TestSensitive(unittest.TestCase):
+    TEXT = ("第一章 开端\n主角说这不算什么。\n平静的一行。\n"
+            "第二行提到那个词。\n主角又提了一次。")
+
+    def test_find_hits_case_insensitive(self):
+        text = "第一行 abc\n第二行 ABC 和 abc"
+        hits = processor.find_sensitive_hits(text, ["abc"])
+        self.assertEqual(len(hits), 3)               # 大小写不敏感，逐次计入
+        self.assertEqual([h[0] for h in hits], [1, 2, 2])
+
+    def test_find_hits_line_numbers_and_content(self):
+        hits = processor.find_sensitive_hits(self.TEXT, ["主角"])
+        self.assertEqual([h[0] for h in hits], [2, 5])
+        self.assertIn("主角说", hits[0][2])
+        self.assertEqual(processor.find_sensitive_hits(self.TEXT, []), [])
+
+    def test_summarize_order_and_dedupe(self):
+        text = "甲\n甲甲\n乙\n"
+        hits = processor.find_sensitive_hits(text, ["乙", "甲"])  # 词表顺序优先
+        agg = processor.summarize_sensitive_hits(hits, ["乙", "甲"])
+        self.assertEqual([kw for kw, _, _ in agg], ["乙", "甲"])
+        self.assertEqual(agg[1], ("甲", 3, [1, 2]))   # 同一行去重
+        # 未命中的词也保留（计数 0）
+        agg2 = processor.summarize_sensitive_hits([], ["甲", "乙"])
+        self.assertEqual(agg2[0], ("甲", 0, []))
+
+    def test_format_report(self):
+        agg = [("词A", 2, [3, 17]), ("词B", 0, [])]
+        report = processor.format_sensitive_report([("小说.txt", agg)], ["词A", "词B"])
+        self.assertIn("命中 1/2 个词，共 2 处", report)
+        self.assertIn("【词A】2 处 —— 第 3、17 行", report)
+        self.assertIn("未命中：词B", report)
+        self.assertIn("合计：2 处命中", report)
 
 
 if __name__ == "__main__":

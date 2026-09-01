@@ -76,7 +76,11 @@
  36. 统计报告新增「章节节奏提示」：中位章字数基准线（分布图叠加黄色虚线）、
      最长/最短章、异常短章（低于中位 40%）与连续短章段（水更/断更嫌疑）
  37. 统计报告新增「人物出场曲线」：按章节统计指定人名出现次数的多折线图（GUI 报告时询问人名，
-     CLI stats --names 甲,乙）
+     CLI stats --names）
+
+2.10 新增：
+ 38. 新增 敏感词检查：自定义词表（随设置记忆/可从文件导入），定位所有包含敏感词的行
+     （大小写不敏感，只读分析不修改内容），结果弹窗支持复制/另存；CLI sensitive 子命令
 
 所有处理仅修改内存，需手动"保存到原文件"或"另存为新文件"才会写盘。
 运行依赖：tkinterdnd2（可选，pip install tkinterdnd2，用于拖放）
@@ -112,7 +116,7 @@ except ImportError:
     DND_AVAILABLE = False
 
 # 默认窗口标题
-_APP_VERSION = "2.9"
+_APP_VERSION = "2.10"
 DEFAULT_TITLE = f"全能TXT文本处理器 {_APP_VERSION}"
 
 # ------------------------------ 界面主题配色（扁平化浅色主题） ------------------------------
@@ -1100,6 +1104,62 @@ def convert_file_stream(src, dst, target_encoding, chunk_size=1024 * 1024):
     return src_enc, replaced
 
 
+# ------------------------------ 敏感词检查 ------------------------------
+def find_sensitive_hits(text, keywords):
+    """敏感词定位（大小写不敏感的包含匹配，只读不改内容）。
+    返回 [(行号(1基), 关键词, 该行内容)]，按行号排序；同行多次命中分别计入。"""
+    hits = []
+    for kw in dict.fromkeys(k for k in keywords if k):
+        pattern = re.compile(re.escape(kw), re.IGNORECASE)
+        for m in pattern.finditer(text):
+            line_start = text.rfind("\n", 0, m.start()) + 1
+            line_end = text.find("\n", m.end())
+            if line_end == -1:
+                line_end = len(text)
+            hits.append((text.count("\n", 0, m.start()) + 1, kw,
+                         text[line_start:line_end].strip()))
+    hits.sort(key=lambda h: h[0])
+    return hits
+
+
+def summarize_sensitive_hits(hits, keywords):
+    """按关键词聚合命中：返回 [(关键词, 出现次数, [去重行号...])]，保持词表原顺序。"""
+    order = {kw: i for i, kw in enumerate(dict.fromkeys(k for k in keywords if k))}
+    agg = {kw: {"count": 0, "lines": []} for kw in order}
+    for lineno, kw, _line in hits:
+        if kw in agg:
+            agg[kw]["count"] += 1
+            if lineno not in agg[kw]["lines"]:
+                agg[kw]["lines"].append(lineno)
+    return [(kw, info["count"], info["lines"])
+            for kw, info in sorted(agg.items(), key=lambda kv: order[kv[0]])]
+
+
+def format_sensitive_report(results, keywords):
+    """results: [(文件名, [(关键词, 次数, [行号...])])] -> 文本报告（GUI 弹窗与 CLI 共用）"""
+    n_keywords = len({k for k in keywords if k})
+    lines = [f"敏感词检查报告 · {time.strftime('%Y-%m-%d %H:%M')}", ""]
+    grand_total = 0
+    for fname, agg in results:
+        hit_items = [(kw, cnt, linenos) for kw, cnt, linenos in agg if cnt]
+        file_total = sum(cnt for _, cnt, _ in hit_items)
+        grand_total += file_total
+        lines.append(f"═══ {fname} ═══")
+        if not hit_items:
+            lines.append("未命中任何敏感词")
+        else:
+            lines.append(f"命中 {len(hit_items)}/{n_keywords} 个词，共 {file_total} 处")
+            for kw, cnt, linenos in hit_items:
+                shown = "、".join(str(n) for n in linenos[:20]) + ("…" if len(linenos) > 20 else "")
+                lines.append(f"  【{kw}】{cnt} 处 —— 第 {shown} 行")
+            missed = [kw for kw, cnt, _ in agg if not cnt]
+            if missed:
+                lines.append(f"  未命中：{'、'.join(missed)}")
+        lines.append("")
+    lines.append(f"合计：{grand_total} 处命中")
+    return "\n".join(lines)
+
+
 class TextProcessorApp:
     def __init__(self, root):
         self.root = root
@@ -1129,6 +1189,8 @@ class TextProcessorApp:
         self.epub_author = ""          # EPUB 导出作者名（持久化）
         self.newline_var = tk.StringVar(value="默认")  # 保存时的换行符模式
         self._undo_stack = []          # 批量操作撤销栈（仅内存内容，不影响磁盘）
+        self.sensitive_words = []      # 敏感词检查词表（持久化）
+        self._task_done_callback = None  # 任务完成后的附加回调（如打开结果窗口）
 
         # 界面控件注册
         self.task_buttons = []         # 任务执行期间需要禁用的按钮
@@ -1374,9 +1436,12 @@ class TextProcessorApp:
             self.ad_filter_words = [str(w) for w in words if str(w).strip()]
         self.ad_whole_line = bool(settings.get("ad_whole_line", False))
         self.epub_author = str(settings.get("epub_author", ""))
+        words = settings.get("sensitive_words")
+        if isinstance(words, list):
+            self.sensitive_words = [str(w) for w in words if str(w).strip()]
 
     def save_settings(self):
-        """保存设置（编码、窗口大小、换行符、广告过滤词、EPUB 作者名）"""
+        """保存设置（编码、窗口大小、换行符、广告过滤词、EPUB 作者名、敏感词表）"""
         try:
             with open(self._settings_path, "w", encoding="utf-8") as f:
                 json.dump({
@@ -1386,6 +1451,7 @@ class TextProcessorApp:
                     "ad_filter_words": self.ad_filter_words,
                     "ad_whole_line": self.ad_whole_line,
                     "epub_author": self.epub_author,
+                    "sensitive_words": self.sensitive_words,
                 }, f, ensure_ascii=False, indent=2)
         except Exception:
             pass
@@ -1410,7 +1476,7 @@ class TextProcessorApp:
         header_inner.pack(fill=tk.X, padx=14, pady=8)
         tk.Label(header_inner, text="全能TXT文本处理器", bg=COLOR_PRIMARY, fg="#FFFFFF",
                  font=(face, 15, "bold")).pack(side=tk.LEFT)
-        tk.Label(header_inner, text="v2.9 · 仅修改内存 · 手动保存", bg=COLOR_PRIMARY,
+        tk.Label(header_inner, text="v2.10 · 仅修改内存 · 手动保存", bg=COLOR_PRIMARY,
                  fg="#BFDBFE", font=(face, 9)).pack(side=tk.LEFT, padx=(10, 0), pady=(4, 0))
         # 检查更新（标题栏右侧扁平小按钮）
         tk.Button(header_inner, text="检查更新", command=self.check_update,
@@ -1647,15 +1713,16 @@ class TextProcessorApp:
                 self._action_button(row, text, cmd)
 
         # 内容提取组
-        extract_group = ttk.LabelFrame(right_frame, text="内容提取（结果显示在弹出窗口）",
+        extract_group = ttk.LabelFrame(right_frame, text="内容提取与检查（结果显示在弹出窗口）",
                                        style="Card.TLabelframe")
 
         extract_btn_frame = ttk.Frame(extract_group)
         extract_btn_frame.pack(fill=tk.X, pady=6, padx=4)
-        ttk.Label(extract_btn_frame, text="提取", style="Muted.TLabel", width=5).pack(side=tk.LEFT)
+        ttk.Label(extract_btn_frame, text="提取/检查", style="Muted.TLabel", width=5).pack(side=tk.LEFT)
         ttk.Button(extract_btn_frame, text="邮箱", command=self.extract_emails).pack(side=tk.LEFT, padx=3, pady=2)
         ttk.Button(extract_btn_frame, text="URL", command=self.extract_urls).pack(side=tk.LEFT, padx=3, pady=2)
         ttk.Button(extract_btn_frame, text="手机号", command=self.extract_phones).pack(side=tk.LEFT, padx=3, pady=2)
+        ttk.Button(extract_btn_frame, text="敏感词", command=self.check_sensitive_words).pack(side=tk.LEFT, padx=3, pady=2)
 
         # 保存与统计组（含进度条）
         save_group = ttk.LabelFrame(right_frame, text="保存与统计", style="Card.TLabelframe")
@@ -1896,6 +1963,10 @@ class TextProcessorApp:
             last = self._undo_stack[-1]
             self.status_var.set(self.status_var.get()
                                 + f" | 可撤销：{last['label']} 等 {len(self._undo_stack)} 步")
+        if self._task_done_callback:
+            callback = self._task_done_callback
+            self._task_done_callback = None
+            callback()
 
     # ------------------------------ 编辑同步 ------------------------------
     def _on_editor_modified(self, event=None):
@@ -3069,6 +3140,143 @@ class TextProcessorApp:
         ttk.Button(btn_bar, text="复制全部", command=copy_all, style="Primary.TButton").pack(side=tk.LEFT, padx=3, pady=3)
         ttk.Button(btn_bar, text="保存为文件", command=save_to_file).pack(side=tk.LEFT, padx=3, pady=3)
 
+    # ------------------------------ 敏感词检查 ------------------------------
+    def check_sensitive_words(self):
+        """敏感词检查：按词表定位命中行（只读分析，不修改任何内容）"""
+        if self._busy_guard():
+            return
+        target_files = self._select_target_files("检查")
+        if not target_files:
+            return
+        self._show_sensitive_dialog(target_files)
+
+    def _show_sensitive_dialog(self, target_files):
+        """敏感词表编辑弹窗：支持手动输入/从文件导入，词表随设置持久化"""
+        win = tk.Toplevel(self.root)
+        win.title("敏感词检查")
+        win.geometry("520x430")
+        win.configure(bg=COLOR_CARD)
+        win.transient(self.root)
+
+        ttk.Label(win, text="每行一个敏感词，将定位所有包含敏感词的行（只读检查，不修改内容）：",
+                  style="Muted.TLabel").pack(anchor=tk.W, padx=10, pady=(10, 4))
+
+        scroll = ttk.Scrollbar(win)
+        scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        words_box = tk.Text(win, wrap=tk.WORD)
+        self._style_input_widget(words_box, font=self.listbox_font)
+        words_box.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
+        words_box.config(yscrollcommand=scroll.set)
+        scroll.config(command=words_box.yview)
+        if self.sensitive_words:
+            words_box.insert("1.0", "\n".join(self.sensitive_words))
+
+        def import_words():
+            path = filedialog.askopenfilename(
+                title="选择词表文件（每行一个）",
+                filetypes=[("纯文本文件", "*.txt"), ("所有文件", "*.*")], parent=win)
+            if not path:
+                return
+            try:
+                content, _ = self._read_text(path, "utf-8")
+                existing = [w.strip() for w in words_box.get("1.0", "end-1c").splitlines()]
+                merged = [w for w in existing + [w2.strip() for w2 in content.splitlines()] if w]
+                seen = set()
+                merged = [w for w in merged if not (w in seen or seen.add(w))]
+                words_box.delete("1.0", tk.END)
+                words_box.insert("1.0", "\n".join(merged))
+            except Exception as e:
+                messagebox.showerror("错误", f"读取词表文件失败：{e}", parent=win)
+
+        def confirm():
+            words = []
+            seen = set()
+            for w in words_box.get("1.0", "end-1c").splitlines():
+                w = w.strip()
+                if w and w not in seen:
+                    seen.add(w)
+                    words.append(w)
+            self.sensitive_words = words
+            self.save_settings()
+            win.destroy()
+            if not words:
+                messagebox.showinfo("提示", "词表为空，未执行检查")
+                return
+            self._run_sensitive_check(target_files, words)
+
+        btn_bar = ttk.Frame(win, style="Page.TFrame")
+        btn_bar.pack(fill=tk.X, padx=10, pady=(0, 10))
+        ttk.Button(btn_bar, text="从文件导入", command=import_words).pack(side=tk.LEFT, padx=3)
+        ttk.Button(btn_bar, text="开始检查", command=confirm, style="Primary.TButton").pack(side=tk.RIGHT, padx=3)
+        ttk.Button(btn_bar, text="取消", command=win.destroy).pack(side=tk.RIGHT, padx=3)
+
+    def _run_sensitive_check(self, target_files, keywords):
+        """后台执行敏感词定位，完成后通过回调打开结果窗口"""
+        self._task_done_callback = lambda: self._show_sensitive_result(self._sensitive_result, keywords)
+
+        def worker():
+            q = self.task_queue
+            results = []
+            for idx, file_path in enumerate(target_files):
+                try:
+                    content = self.file_contents.get(file_path, "")
+                    hits = find_sensitive_hits(content, keywords)
+                    results.append((os.path.basename(file_path),
+                                    summarize_sensitive_hits(hits, keywords)))
+                except Exception as e:
+                    q.put(("error", f"{os.path.basename(file_path)}：{str(e)}"))
+                q.put(("progress", (idx + 1) * 100 / len(target_files)))
+
+            q.put(("progress", 0))
+            self._sensitive_result = results
+            q.put(("status", f"敏感词检查完成 | {len(target_files)} 个文件 | 结果见弹窗"))
+            q.put(("done_msg", "检查完成，结果窗口即将打开"))
+
+        self._start_task(worker, done_title="敏感词检查")
+
+    def _show_sensitive_result(self, results, keywords):
+        """弹出敏感词检查结果窗口（主线程）"""
+        if not results:
+            return
+        report = format_sensitive_report(results, keywords)
+        win = tk.Toplevel(self.root)
+        win.title("敏感词检查结果")
+        win.geometry("640x520")
+        win.configure(bg=COLOR_CARD)
+        win.transient(self.root)
+
+        result_text = tk.Text(win, wrap=tk.WORD)
+        self._style_input_widget(result_text, font=self.listbox_font)
+        scrollbar = ttk.Scrollbar(win, command=result_text.yview)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        result_text.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
+        result_text.config(yscrollcommand=scrollbar.set)
+        result_text.insert("1.0", report)
+
+        def copy_all():
+            self.root.clipboard_clear()
+            self.root.clipboard_append(report)
+            self.status_var.set("敏感词检查报告已复制到剪贴板")
+
+        def save_to_file():
+            path = filedialog.asksaveasfilename(
+                title="保存检查报告",
+                defaultextension=".txt",
+                filetypes=[("纯文本文件", "*.txt"), ("所有文件", "*.*")])
+            if not path:
+                return
+            try:
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(report)
+                self.status_var.set(f"检查报告已保存：{os.path.basename(path)}")
+            except Exception as e:
+                messagebox.showerror("错误", f"保存失败：{str(e)}")
+
+        btn_bar = ttk.Frame(win)
+        btn_bar.pack(fill=tk.X, padx=6, pady=(0, 6))
+        ttk.Button(btn_bar, text="复制全部", command=copy_all, style="Primary.TButton").pack(side=tk.LEFT, padx=3, pady=3)
+        ttk.Button(btn_bar, text="保存为文件", command=save_to_file).pack(side=tk.LEFT, padx=3, pady=3)
+
     # ------------------------------ 保存与统计功能 ------------------------------
     def count_text_words(self):
         """统计当前显示文本的字数"""
@@ -3474,7 +3682,7 @@ class TextProcessorApp:
 # ------------------------------ 命令行模式 ------------------------------
 # 不启动界面，便于脚本化批量处理；不带参数运行仍是图形界面
 _CLI_COMMANDS = {"split", "epub", "docx", "epub2txt", "dedup", "sort",
-                 "adfilter", "convert", "stats", "hex", "diff", "version"}
+                 "adfilter", "convert", "stats", "hex", "diff", "version", "sensitive"}
 
 
 def _cli_inplace_write(path, content, encode):
@@ -3741,6 +3949,27 @@ def _cli_cmd_epub2txt(args):
     return 0
 
 
+def _cli_cmd_sensitive(args):
+    words_content, _ = read_text_smart(args.words_file, "utf-8")
+    keywords = list(dict.fromkeys(w.strip() for w in words_content.splitlines() if w.strip()))
+    if not keywords:
+        print("错误：词表为空", file=sys.stderr)
+        return 1
+    results = []
+    for path in args.files:
+        content, _ = read_text_smart(path, args.encoding)
+        hits = find_sensitive_hits(content, keywords)
+        results.append((os.path.basename(path), summarize_sensitive_hits(hits, keywords)))
+    report = format_sensitive_report(results, keywords)
+    if args.out:
+        with open(args.out, "w", encoding="utf-8") as f:
+            f.write(report)
+        print(f"已生成敏感词检查报告：{args.out}")
+    else:
+        print(report)
+    return 0
+
+
 def build_cli_parser():
     parser = argparse.ArgumentParser(
         prog="全能TXT文本处理器",
@@ -3836,6 +4065,13 @@ def build_cli_parser():
     p.add_argument("file", help=".epub 文件")
     p.add_argument("--out", required=True, help="输出的 .txt 路径（UTF-8）")
     p.set_defaults(func=_cli_cmd_epub2txt)
+
+    p = sub.add_parser("sensitive", help="敏感词检查：定位包含敏感词的行（只读不改内容）")
+    p.add_argument("files", nargs="+", help="TXT 文件")
+    p.add_argument("--words-file", required=True, help="词表文件（每行一个，UTF-8）")
+    p.add_argument("--out", default=None, help="输出检查报告路径（缺省打印到 stdout）")
+    p.add_argument("--encoding", default="utf-8")
+    p.set_defaults(func=_cli_cmd_sensitive)
 
     return parser
 
