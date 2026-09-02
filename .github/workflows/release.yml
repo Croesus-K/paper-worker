@@ -37,12 +37,22 @@ jobs:
       - name: Install dependencies
         run: pip install pyinstaller tkinterdnd2
 
+      # UPX 压缩体积（macOS 不支持，跳过）；排除 vcruntime 避免启动异常与误报
+      - name: Install UPX (windows)
+        if: matrix.os == 'windows-latest'
+        run: choco install upx -y --no-progress
+      - name: Install UPX (linux)
+        if: matrix.os == 'ubuntu-latest'
+        run: sudo apt-get update && sudo apt-get install -y upx-ucl
+
       - name: Build binary
         shell: bash
         run: |
           python -m PyInstaller --onefile --windowed \
             --name "PaperWorker-${{ github.ref_name }}-${{ matrix.slug }}" \
             --collect-all tkinterdnd2 \
+            --upx-exclude vcruntime140.dll \
+            --upx-exclude vcruntime140_1.dll \
             "全能TXT文本处理器.py"
 
       # macOS 的 windowed 模式会额外产出 .app 目录包，上传 artifact 前移除，只留单文件
