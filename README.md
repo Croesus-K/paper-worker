@@ -68,6 +68,17 @@
 - 扁平化浅色主题、卡片式分组、编辑区右键菜单（撤销 / 剪贴板 / 全选）
 - 未安装拖放库时自动降级为无拖放模式，功能不受影响
 
+### 报告导出 PDF（v2.12 新增）
+- GUI 生成报告时可选择**同时导出 PDF 版本**（调用本机 Edge/Chrome 无头模式打印，覆盖 Windows/macOS/Linux 常见安装路径）
+- CLI：`stats 小说.txt --pdf 报告.pdf`（可单独使用，不需要 `--out`）
+
+### 包管理器分发（v2.12 新增）
+- [Scoop](https://scoop.sh) 清单随仓库发布，发版时 CI 自动更新版本号与 sha256：
+  ```bash
+  scoop install https://raw.githubusercontent.com/Croesus-K/paper-worker/main/paper-worker.json
+  ```
+- 安装后 `PaperWorker-*-windows.exe` 进入 PATH，可双击启动 GUI 或直接执行 CLI 子命令
+
 ## 安全性设计
 
 所有处理**仅修改内存**，需要手动"保存到原文件"或"另存为新文件"才会写盘；写回原文件前会自动生成一次 `.bak` 备份（按字节复制，原样保留原始内容）。保存时可选择换行符格式（系统默认 / LF / CRLF）。
@@ -160,6 +171,9 @@ python 全能TXT文本处理器.py sensitive 小说.txt --words-file 词表.txt
 
 # 启动 Web 工作台（浏览器操作，见上文专节）
 python 全能TXT文本处理器.py serve
+
+# 统计报告直接导出 PDF（需要本机 Edge/Chrome）
+python 全能TXT文本处理器.py stats 小说.txt --pdf 报告.pdf
 
 # 全部子命令支持 --pattern 自定义章节正则、--encoding 指定读取编码
 python 全能TXT文本处理器.py --help

@@ -89,6 +89,14 @@
      本地打开/上传 TXT → 在线编辑 → 全部文本处理/小说清洗 → 下载/写回，
      并可在线导出 EPUB/DOCX/章节 ZIP/统计报告
 
+2.12 新增：
+ 42. UPX 压缩：CI 在 windows/linux 构建时自动压缩单文件体积（排除 vcruntime 保证启动）
+ 43. Scoop 包管理器分发：清单随仓库发布，CI 发版后自动更新版本号与 sha256
+     （scoop install https://raw.githubusercontent.com/Croesus-K/paper-worker/main/paper-worker.json）
+ 44. 敏感词结果可点击：单击带行号的行直接跳转主编辑器对应文件与行（行级高亮）
+ 45. 报告导出 PDF：调用本机 Edge/Chrome 无头模式打印（GUI 报告时可选、CLI stats --pdf），
+     覆盖 Windows/macOS/Linux 常见安装路径
+
 所有处理仅修改内存，需手动"保存到原文件"或"另存为新文件"才会写盘。
 运行依赖：tkinterdnd2（可选，pip install tkinterdnd2，用于拖放）
 """
@@ -104,6 +112,7 @@ import os
 import posixpath
 import queue
 import re
+import subprocess
 import sys
 import tempfile
 import threading
@@ -126,7 +135,7 @@ except ImportError:
     DND_AVAILABLE = False
 
 # 默认窗口标题
-_APP_VERSION = "2.11"
+_APP_VERSION = "2.12"
 DEFAULT_TITLE = f"全能TXT文本处理器 {_APP_VERSION}"
 
 # ------------------------------ 界面主题配色（可切换浅色/深色） ------------------------------
@@ -811,6 +820,49 @@ def count_name_per_chapter(chapter_blocks, names):
     chapter_blocks: [(标题或None, 正文)]；返回 [(人名, [每章次数...])]"""
     bodies = [b for _, b in chapter_blocks if b.strip()]
     return [(name, [body.count(name) for body in bodies]) for name in names]
+
+
+# ------------------------------ HTML 报告导出 PDF ------------------------------
+_PDF_BROWSERS = [
+    r"%ProgramFiles(x86)%\Microsoft\Edge\Application\msedge.exe",
+    r"%ProgramFiles%\Microsoft\Edge\Application\msedge.exe",
+    r"%LocalAppData%\Microsoft\Edge\Application\msedge.exe",
+    r"%ProgramFiles%\Google\Chrome\Application\chrome.exe",
+    r"%ProgramFiles(x86)%\Google\Chrome\Application\chrome.exe",
+    r"%LocalAppData%\Google\Chrome\Application\chrome.exe",
+    "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+    "/usr/bin/chromium-browser",
+    "/usr/bin/chromium",
+    "/usr/bin/google-chrome",
+]
+
+
+def _find_pdf_browser():
+    """寻找本机可用的 Edge/Chrome。返回可执行文件路径；找不到抛异常。"""
+    for raw in _PDF_BROWSERS:
+        exe = os.path.expandvars(raw)
+        if exe and os.path.exists(exe):
+            return exe
+    raise RuntimeError("未找到 Edge/Chrome，无法导出 PDF"
+                       "（可打开 HTML 报告后按 Ctrl+P 手动打印）")
+
+
+def html_to_pdf(html_path, pdf_path, timeout=90):
+    """调用本机 Edge/Chrome 无头模式把 HTML 报告打印为 PDF。返回所用浏览器路径。"""
+    exe = _find_pdf_browser()
+    uri = "file:///" + quote(os.path.abspath(html_path).replace("\\", "/"))
+    pdf_path = os.path.abspath(pdf_path)
+    if os.path.exists(pdf_path):
+        os.remove(pdf_path)  # 无头打印不会覆盖已有文件，先清掉旧文件
+    result = subprocess.run(
+        [exe, "--headless", "--disable-gpu", "--no-pdf-header-footer",
+         f"--print-to-pdf={pdf_path}", uri],
+        timeout=timeout, capture_output=True)
+    if not os.path.exists(pdf_path) or os.path.getsize(pdf_path) == 0:
+        detail = result.stderr.decode("utf-8", errors="replace")[-300:] if result.stderr else ""
+        raise RuntimeError(f"PDF 生成失败{('：' + detail) if detail else ''}")
+    return exe
 
 
 def svg_hbars(items, width=880, color="#2563EB"):
@@ -3514,6 +3566,16 @@ class TextProcessorApp:
         names_raw = simpledialog.askstring(
             "人物追踪", "输入要统计出场次数的人名（逗号分隔，留空跳过）：", parent=self.root)
         names = [n.strip() for n in (names_raw or "").replace("，", ",").split(",") if n.strip()]
+        # PDF 选项仅对单文件报告提供
+        pdf_path = None
+        if len(target_files) == 1 and messagebox.askyesno(
+                "导出 PDF", "是否同时用本机 Edge/Chrome 无头模式导出 PDF 版本？"):
+            pdf_path = filedialog.asksaveasfilename(
+                title="保存 PDF 报告", defaultextension=".pdf",
+                initialfile=os.path.splitext(default_name)[0] + ".pdf",
+                filetypes=[("PDF 文档", "*.pdf"), ("所有文件", "*.*")])
+            if not pdf_path:
+                pdf_path = None
         pattern = re.compile(_CHAPTER_PRESETS["第X章+序章/楔子/番外"])
 
         def worker():
@@ -3534,6 +3596,12 @@ class TextProcessorApp:
                         f.write(report)
                     done += 1
                     q.put(("status", f"已生成报告：{os.path.basename(out)}"))
+                    if pdf_path and len(target_files) == 1:
+                        try:
+                            browser = html_to_pdf(out, pdf_path)
+                            q.put(("status", f"PDF 已导出（{os.path.basename(browser)}）"))
+                        except Exception as e:
+                            q.put(("error", f"PDF 导出失败：{e}"))
                 except Exception as e:
                     q.put(("error", f"{os.path.basename(file_path)}：{str(e)}"))
                 q.put(("progress", (idx + 1) * 100 / len(target_files)))
@@ -4062,11 +4130,23 @@ def _cli_cmd_stats(args):
     stem = os.path.splitext(os.path.basename(args.file))[0]
     pattern = (re.compile(args.pattern) if args.pattern
                else re.compile(_CHAPTER_PRESETS[args.preset]))
-    if args.out:
+    if args.out or args.pdf:
         report = build_text_report(content, stem, pattern)
-        with open(args.out, "w", encoding="utf-8") as f:
-            f.write(report)
-        print(f"已生成 HTML 报告：{args.out}")
+        html_src = args.out
+        if html_src:
+            with open(html_src, "w", encoding="utf-8") as f:
+                f.write(report)
+        if args.pdf:
+            if not html_src:
+                html_src = os.path.join(tempfile.gettempdir(), f"{stem}_报告_tmp.html")
+                with open(html_src, "w", encoding="utf-8") as f:
+                    f.write(report)
+            browser = html_to_pdf(html_src, args.pdf)
+            if not args.out:
+                os.remove(html_src)
+            print(f"已生成 PDF 报告：{args.pdf}（{os.path.basename(browser)}）")
+        else:
+            print(f"已生成 HTML 报告：{args.out}")
         return 0
     blocks = split_chapters_by_pattern(content, pattern)
     stats = compute_text_stats(content)
@@ -4215,6 +4295,7 @@ def build_cli_parser():
     p = sub.add_parser("stats", help="文本统计：默认打印 JSON 概览，--out 生成 HTML 可视化报告")
     p.add_argument("file", help="TXT 文件")
     p.add_argument("--out", default=None, help="输出 HTML 报告路径（缺省打印 JSON）")
+    p.add_argument("--pdf", default=None, help="额外导出 PDF 报告路径（需要本机 Edge/Chrome）")
     p.add_argument("--preset", default="第X章+序章/楔子/番外",
                    choices=list(_CHAPTER_PRESETS), help="章节规则（影响章节数统计）")
     p.add_argument("--pattern", default=None, help="自定义章节标题正则（优先于 --preset）")

@@ -805,5 +805,22 @@ class TestWeb(unittest.TestCase):
         self.assertEqual(r2.status, 400)
 
 
+    def test_html_to_pdf(self):
+        import tempfile
+        try:
+            processor._find_pdf_browser()
+        except RuntimeError:
+            self.skipTest("本机无 Edge/Chrome，跳过 PDF 导出测试")
+        with tempfile.TemporaryDirectory() as d:
+            html_path = os.path.join(d, "测试报告.html")
+            with open(html_path, "w", encoding="utf-8") as f:
+                f.write("<html><body><h1>中文标题测试</h1><p>PDF 导出验证。</p></body></html>")
+            pdf_path = os.path.join(d, "测试报告.pdf")
+            browser = processor.html_to_pdf(html_path, pdf_path)
+            self.assertTrue(os.path.exists(pdf_path))
+            self.assertGreater(os.path.getsize(pdf_path), 1000)
+            self.assertRegex(browser.lower(), r"msedge|chrome")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
