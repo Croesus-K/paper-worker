@@ -91,3 +91,55 @@ jobs:
             --notes "自动构建于 GitHub Actions（提交 ${{ github.sha }}）。Windows 下载 PaperWorker-*-windows.exe，Linux/macOS 下载对应后缀文件并 chmod +x 后运行（需要图形环境）。杀软若误报请添加信任或从源码运行。" \
             release_files/PaperWorker-* \
           || gh release upload "${{ github.ref_name }}" release_files/PaperWorker-* --clobber
+
+      - name: Update scoop manifest
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 - <<'EOF'
+          import base64, hashlib, json, os, urllib.request
+
+          tag = os.environ["GITHUB_REF_NAME"]
+          version = tag.lstrip("v")
+          exe = f"release_files/PaperWorker-{tag}-windows.exe"
+          if not os.path.exists(exe):
+              print("windows 可执行文件不存在，跳过清单更新")
+              raise SystemExit(0)
+          with open(exe, "rb") as f:
+              sha = hashlib.sha256(f.read()).hexdigest()
+          manifest = {
+              "version": version,
+              "homepage": "https://github.com/Croesus-K/paper-worker",
+              "description": "全能TXT文本处理器 —— 中文 TXT 批量处理：编码转换、查找替换、章节分割、小说清洗、EPUB/DOCX 导出、统计报告、Web 工作台。",
+              "license": "MIT",
+              "notes": "双击 PaperWorker-*.exe 启动图形界面；命令行模式下同目录执行该程序即可（serve/split/epub 等子命令）。",
+              "url": f"https://github.com/Croesus-K/paper-worker/releases/download/{tag}/PaperWorker-{tag}-windows.exe",
+              "hash": sha,
+              "bin": f"PaperWorker-{tag}-windows.exe",
+              "shortcuts": [[f"PaperWorker-{tag}-windows.exe", "全能TXT文本处理器"]],
+              "checkver": "github",
+              "autoupdate": {
+                  "url": "https://github.com/Croesus-K/paper-worker/releases/download/v$version/PaperWorker-v$version-windows.exe",
+                  "bin": "PaperWorker-v$version-windows.exe",
+                  "shortcuts": [["PaperWorker-v$version-windows.exe", "全能TXT文本处理器"]],
+              },
+          }
+          api = f"https://api.github.com/repos/{os.environ['GITHUB_REPOSITORY']}/contents/paper-worker.json"
+          headers = {"Authorization": f"token {os.environ['GH_TOKEN']}",
+                     "Accept": "application/vnd.github+json"}
+          try:
+              with urllib.request.urlopen(urllib.request.Request(api, headers=headers)) as r:
+                  file_sha = json.load(r)["sha"]
+          except Exception:
+              file_sha = None
+          content = base64.b64encode(json.dumps(
+              manifest, ensure_ascii=False, indent=4).encode("utf-8")).decode()
+          body = {"message": f"chore: scoop manifest {tag} [skip ci]",
+                  "content": content}
+          if file_sha:
+              body["sha"] = file_sha
+          req = urllib.request.Request(api, data=json.dumps(body).encode(), headers=headers, method="PUT")
+          with urllib.request.urlopen(req) as r:
+              print("scoop 清单已更新:", json.load(r)["commit"]["sha"][:8])
+          EOF

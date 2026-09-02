@@ -1,0 +1,27 @@
+{
+    "version": "2.11",
+    "homepage": "https://github.com/Croesus-K/paper-worker",
+    "description": "全能TXT文本处理器 —— 中文 TXT 批量处理：编码转换、查找替换、章节分割、小说清洗、EPUB/DOCX 导出、统计报告、Web 工作台。",
+    "license": "MIT",
+    "notes": "双击 PaperWorker-*.exe 启动图形界面；命令行模式下同目录执行该程序即可（如 serve/split/epub 等子命令）。",
+    "url": "https://github.com/Croesus-K/paper-worker/releases/download/v2.11/PaperWorker-v2.11-windows.exe",
+    "hash": "",
+    "bin": "PaperWorker-v2.11-windows.exe",
+    "shortcuts": [
+        [
+            "PaperWorker-v2.11-windows.exe",
+            "全能TXT文本处理器"
+        ]
+    ],
+    "checkver": "github",
+    "autoupdate": {
+        "url": "https://github.com/Croesus-K/paper-worker/releases/download/v$version/PaperWorker-v$version-windows.exe",
+        "bin": "PaperWorker-v$version-windows.exe",
+        "shortcuts": [
+            [
+                "PaperWorker-v$version-windows.exe",
+                "全能TXT文本处理器"
+            ]
+        ]
+    }
+}
