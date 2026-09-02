@@ -3354,6 +3354,7 @@ class TextProcessorApp:
 
     def _run_sensitive_check(self, target_files, keywords):
         """后台执行敏感词定位，完成后通过回调打开结果窗口"""
+        self._sensitive_paths = {os.path.basename(fp): fp for fp in target_files}
         self._task_done_callback = lambda: self._show_sensitive_result(self._sensitive_result, keywords)
 
         def worker():
@@ -3377,15 +3378,18 @@ class TextProcessorApp:
         self._start_task(worker, done_title="敏感词检查")
 
     def _show_sensitive_result(self, results, keywords):
-        """弹出敏感词检查结果窗口（主线程）"""
+        """弹出敏感词检查结果窗口（主线程）。单击带行号的行可跳转主编辑器定位。"""
         if not results:
             return
         report = format_sensitive_report(results, keywords)
         win = tk.Toplevel(self.root)
         win.title("敏感词检查结果")
-        win.geometry("640x520")
+        win.geometry("640x540")
         win.configure(bg=COLOR_CARD)
         win.transient(self.root)
+
+        ttk.Label(win, text="单击带行号的行，可跳转主编辑器到对应位置（仅内存视图，不影响磁盘）：",
+                  style="Muted.TLabel").pack(anchor=tk.W, padx=10, pady=(8, 0))
 
         result_text = tk.Text(win, wrap=tk.WORD)
         self._style_input_widget(result_text, font=self.listbox_font)
@@ -3394,6 +3398,42 @@ class TextProcessorApp:
         result_text.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
         result_text.config(yscrollcommand=scrollbar.set)
         result_text.insert("1.0", report)
+
+        def on_click(event):
+            try:
+                click_line = int(result_text.index(f"@{event.x},{event.y}").split(".")[0])
+            except Exception:
+                return
+            content_lines = report.split("\n")
+            if click_line - 1 >= len(content_lines):
+                return
+            # 向上找到点击行所属的文件段
+            cur_file = None
+            for i in range(click_line - 1, -1, -1):
+                m = re.match(r"═══ (.+) ═══", content_lines[i])
+                if m:
+                    cur_file = m.group(1)
+                    break
+            m_line = re.search(r"第 (\d+)", content_lines[click_line - 1])
+            if not cur_file or not m_line:
+                return  # 文件头/汇总行，不可跳转
+            path = self._sensitive_paths.get(cur_file)
+            if not path or path not in self.file_list:
+                return
+            fidx = self.file_list.index(path)
+            self.file_listbox.selection_clear(0, tk.END)
+            self.file_listbox.selection_set(fidx)
+            self.file_listbox.see(fidx)
+            self.show_selected_file_content()
+            line_no = int(m_line.group(1))
+            self.text_area.tag_remove("jump", "1.0", tk.END)
+            self.text_area.tag_add("jump", f"{line_no}.0", f"{line_no}.end + 1c")
+            self.text_area.tag_config("jump", background="#FDE68A", foreground="#1F2937")
+            self.text_area.mark_set("insert", f"{line_no}.0")
+            self.text_area.see(f"{line_no}.0")
+            self.status_var.set(f"已定位：{cur_file} 第 {line_no} 行")
+
+        result_text.bind("<Button-1>", on_click)
 
         def copy_all():
             self.root.clipboard_clear()
