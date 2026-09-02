@@ -45,6 +45,11 @@ jobs:
             --collect-all tkinterdnd2 \
             "全能TXT文本处理器.py"
 
+      # macOS 的 windowed 模式会额外产出 .app 目录包，上传 artifact 前移除，只留单文件
+      - name: Remove macOS .app bundle
+        if: matrix.os == 'macos-latest'
+        run: rm -rf dist/*.app
+
       - uses: actions/upload-artifact@v4
         with:
           name: PaperWorker-${{ github.ref_name }}-${{ matrix.slug }}
@@ -59,6 +64,12 @@ jobs:
           merge-multiple: true
           path: dist
 
+      - name: Collect binaries (files only)
+        run: |
+          mkdir -p release_files
+          find dist -maxdepth 1 -type f -name "PaperWorker-*" -exec cp {} release_files/ \;
+          ls -l release_files
+
       - name: Create release and upload binaries
         shell: bash
         env:
@@ -68,5 +79,5 @@ jobs:
             --repo "$GITHUB_REPOSITORY" \
             --title "全能TXT文本处理器 ${{ github.ref_name }}" \
             --notes "自动构建于 GitHub Actions（提交 ${{ github.sha }}）。Windows 下载 PaperWorker-*-windows.exe，Linux/macOS 下载对应后缀文件并 chmod +x 后运行（需要图形环境）。杀软若误报请添加信任或从源码运行。" \
-            dist/PaperWorker-* \
-          || gh release upload "${{ github.ref_name }}" dist/PaperWorker-* --clobber
+            release_files/PaperWorker-* \
+          || gh release upload "${{ github.ref_name }}" release_files/PaperWorker-* --clobber
