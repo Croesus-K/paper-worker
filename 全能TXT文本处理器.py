@@ -856,7 +856,10 @@ def html_to_pdf(html_path, pdf_path, timeout=90):
     if os.path.exists(pdf_path):
         os.remove(pdf_path)  # 无头打印不会覆盖已有文件，先清掉旧文件
     result = subprocess.run(
-        [exe, "--headless", "--disable-gpu", "--no-pdf-header-footer",
+        [exe, "--headless", "--disable-gpu",
+         # Linux 下容器/root 环境通常需要关闭沙箱才能启动无头浏览器
+         *([] if sys.platform.startswith("win") else ["--no-sandbox"]),
+         "--no-pdf-header-footer",
          f"--print-to-pdf={pdf_path}", uri],
         timeout=timeout, capture_output=True)
     if not os.path.exists(pdf_path) or os.path.getsize(pdf_path) == 0:

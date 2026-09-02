@@ -807,6 +807,8 @@ class TestWeb(unittest.TestCase):
 
     def test_html_to_pdf(self):
         import tempfile
+        if not sys.platform.startswith("win"):
+            self.skipTest("PDF 无头打印仅在 Windows CI 上验证（Linux/macOS 无显示环境）")
         try:
             processor._find_pdf_browser()
         except RuntimeError:
